@@ -20,6 +20,9 @@ from pathlib import Path
 
 APP = "remoteplay-display"
 STREAM_SINK = "steam-streaming-playback"
+EVENT_DEBOUNCE = 0.4
+RECONCILE_INTERVAL = 5.0
+MAX_SELECT_WAIT = 2.0
 
 CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
@@ -705,21 +708,28 @@ def _watch_loop(cfg, auto: bool) -> int:
 
 
 def _consume_events(cfg, proc, auto: bool, known: bool) -> bool:
-    """Follow pactl's event stream, reconciling on every sink change and once a second."""
+    """Sleep until a debounced sink event or the safety tick, so idle costs no subprocesses."""
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     pending_until = None
+    last_reconcile = time.monotonic()
     while proc.poll() is None:
-        events = selector.select(timeout=1.0)
-        for _key, _mask in events:
-            line = proc.stdout.readline()
-            if not line:
-                return known
-            if "sink" in line or "server" in line:
-                pending_until = time.monotonic() + 0.4
-        if pending_until is not None and time.monotonic() < pending_until:
+        deadline = pending_until if pending_until else last_reconcile + RECONCILE_INTERVAL
+        wait = max(0.05, min(MAX_SELECT_WAIT, deadline - time.monotonic()))
+        if selector.select(timeout=wait):
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    return known
+                if "sink" in line or "server" in line:
+                    pending_until = time.monotonic() + EVENT_DEBOUNCE
+                if not selector.select(timeout=0):
+                    break
+            continue
+        if pending_until and time.monotonic() < pending_until:
             continue
         pending_until = None
+        last_reconcile = time.monotonic()
         known = _reconcile(cfg, auto, known)
     return known
 
