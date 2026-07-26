@@ -1,29 +1,25 @@
 # remoteplay-display
 
-Routes Steam Remote Play sessions to a dummy HDMI plug on KDE Plasma Wayland, then puts your desktop back exactly as it was.
-
-When a client connects, the host swaps to the dummy plug as its **only** output, at the resolution and refresh rate that best feeds that client. Your real monitors go dark and stay dark. When the session ends, the previous layout is restored — same modes, positions, scales and priorities.
+Routes Steam Remote Play sessions to a dummy HDMI plug on KDE Plasma Wayland. While a client is connected the dummy becomes the host's **only** output, at whatever resolution and refresh rate best feeds that client; when the session ends the previous layout comes back exactly — same modes, positions, scales, priorities.
 
 ## Why
 
-A dummy plug does not stop your monitors from lighting up — Linux happily scans out to a powered-off display, so nothing was waking them in the first place. The real problems it solves are:
+A dummy plug does not stop your monitors from lighting up — Linux happily scans out to a powered-off display, so nothing was waking them in the first place. What it actually fixes:
 
-- **The game renders at your desktop's resolution.** Without this, a game streamed to a Steam Deck renders at your monitor's native 4K165 and gets scaled down to 1280x800. That is a large amount of GPU and encoder work thrown away.
-- **Powering monitors off mid-session reshuffles the desktop.** DisplayPort and HDMI both drop the link when a display loses power, which makes KWin re-lay-out your outputs underneath a running game.
+- **The game renders at your desktop's resolution.** A game streamed to a Steam Deck otherwise renders at your monitor's native 4K165 and gets scaled down to 1280x800 — a lot of GPU and encoder work thrown away.
+- **Powering monitors off mid-session reshuffles the desktop.** DisplayPort and HDMI both drop the link when a display loses power, and KWin re-lays-out your outputs underneath the running game.
 
-Making the dummy the sole output during a session fixes both, and makes the physical power state of your monitors irrelevant.
+Making the dummy the sole output solves both, and makes the monitors' power state irrelevant.
 
 ## How it detects a session
 
-Steam's streaming host loads a PipeWire null sink named `steam-streaming-playback` the moment a Remote Play session starts, repoints the default audio sink at it, and records from its monitor. It unloads the sink when the session ends.
+Steam's streaming host loads a PipeWire null sink named `steam-streaming-playback` when a session starts and unloads it when the session ends. That sink is the trigger — being live system state rather than a log line, it can be watched as an event (`pactl subscribe`) *and* re-queried at any time to recover from a missed event or a crash, which tailing `streaming_log.txt` cannot.
 
-That sink is the trigger. It is live system state rather than a log line, so it can be watched as an event (`pactl subscribe`) *and* re-queried at any time to recover from a missed event or a crash. Tailing Steam's `streaming_log.txt` was the obvious alternative and is strictly worse — the format is undocumented and can't be re-read to answer "what is true right now".
-
-Steam writes `Maximum capture: WxH F FPS` a few milliseconds *before* loading the sink, so the connected client's ceiling is already readable when the trigger fires. A Steam Deck OLED reports `1280x800 89.00 FPS`.
+Steam does write `Maximum capture: WxH F FPS` a few milliseconds before loading the sink, so the client's ceiling is readable the instant the trigger fires. A Steam Deck OLED reports `1280x800 89.00 FPS`.
 
 ## Mode selection
 
-With `mode = auto`, the dummy's mode is scored per client and picked at session start. The key, maximized lexicographically:
+With `mode = auto` the dummy's mode is scored per client at session start, maximizing lexicographically:
 
 1. Can the mode feed the client's frame rate (`refresh >= client_fps - 1`)
 2. Aspect ratio proximity to the client
@@ -31,9 +27,7 @@ With `mode = auto`, the dummy's mode is scored per client and picked at session 
 4. Pixel count proximity to the client
 5. Highest refresh rate
 
-Refresh rate outranks resolution deliberately. Downscaling 1080p to a Deck's 800p costs very little perceptually; 60 fps versus 90 fps is felt immediately. Aspect ratio outranks pixel count because otherwise a 16:9 client can be handed a 21:9 host mode that merely happens to have a closer pixel count.
-
-Set `mode` to something like `2560x1440@60` to pin it instead.
+Refresh outranks resolution deliberately: downscaling 1080p to a Deck's 800p costs very little perceptually, while 60 fps versus 90 fps is felt immediately. Aspect ratio outranks pixel count because otherwise a 16:9 client can be handed a 21:9 host mode that merely happens to have a closer pixel count.
 
 ## Install
 
@@ -45,9 +39,9 @@ cd remoteplay-display
 ./install.sh
 ```
 
-`install.sh` symlinks the script into `~/.local/bin`, installs the user service, seeds `~/.config/remoteplay-display/config.ini`, enables the service and runs `doctor`.
+That symlinks the script and the user service into place, seeds `~/.config/remoteplay-display/config.ini`, enables the service and runs `doctor`. Both are symlinks, so edits in the checkout are live with no reinstall step.
 
-Then set `dummy` in the config to your dummy plug's connector. `remoteplay-display doctor` lists every connector with its EDID product name, which usually makes the dummy obvious:
+Then point `dummy` at your plug's connector. `doctor` lists every connector with its EDID product name, which usually makes it obvious:
 
 ```
 connectors:
@@ -66,9 +60,7 @@ remoteplay-display toggle
 remoteplay-display doctor    # self-check
 ```
 
-The service does this automatically; the manual commands are for testing, or for pinning the host into remote mode ahead of time.
-
-A layout applied by hand is tagged `manual` and a layout applied by the daemon is tagged `auto`. The daemon only ever restores its own — so a manual `on` survives a daemon restart, and stopping the service cleanly returns anything it switched.
+The service handles this automatically. Layouts applied by hand are tagged `manual` and the daemon only ever restores its own, so a manual `on` survives a daemon restart while stopping the service cleanly returns whatever it switched.
 
 ## Configuration
 
@@ -89,13 +81,15 @@ A layout applied by hand is tagged `manual` and a layout applied by the daemon i
 
 **Atomic layout changes.** Every switch is a single `kscreen-doctor` invocation. Mid-transition KWin logs `There are no outputs - creating placeholder screen`; atomicity is the only reason that isn't a visible failure.
 
-**Mode ids, not mode names.** A dummy plug commonly exposes several distinct modes sharing one name — one tested plug has two different modes both called `1920x1080@60`. Layouts are therefore snapshotted as `(width, height, refresh)` and re-resolved against the live mode list at apply time, which also survives connector renumbering across a replug.
+**Mode ids, not mode names.** A dummy plug commonly exposes several distinct modes sharing one name — one tested plug has two different modes both called `1920x1080@60`. Layouts are therefore snapshotted as `(width, height, refresh)` and re-resolved against the live mode list at apply time. This is load-bearing rather than theoretical: KWin renumbers mode ids whenever connectors re-enumerate, so a monitor power-cycle mid-session is enough to invalidate them.
 
-**Verification, not fire-and-forget.** After applying, the state is polled every 250ms until the expected outputs are enabled and the dummy's mode size matches, with one retry before failing loudly. Position and priority are deliberately not asserted, because KWin normalizes output geometry and asserting it produces false failures.
+**Verification, not fire-and-forget.** After applying, state is polled every 250ms until the expected outputs are enabled and the dummy's mode size matches, with one retry before failing loudly. Position and priority are deliberately not asserted, because KWin normalizes output geometry and asserting it produces false failures.
 
 **Idle inhibition.** A detached child holds `org.freedesktop.ScreenSaver.Inhibit` plus a logind `idle:sleep` block for the duration of a session. Gamepad-only input may not reset KWin's idle timer, and a blanked dummy means a black stream with no local display to notice it on.
 
 **Crash recovery.** State is flock'd JSON. A `SIGKILL` leaves it stale; the next start reconciles "marked active, owned by the daemon, but no session sink" and restores. Restore skips outputs that are no longer connected, and if nothing in the snapshot is connected it keeps the dummy enabled rather than leaving KWin with zero outputs.
+
+**Idle cost.** No subprocesses. The watch loop sleeps until either a debounced sink event or a 5s safety tick.
 
 ## Known limits
 
@@ -103,10 +97,6 @@ A layout applied by hand is tagged `manual` and a layout applied by the daemon i
 
 **Games Steam's Vulkan capture layer doesn't attach to** — typically emulators added as non-Steam shortcuts — fail with `k_ECaptureFailedReasonPipewireRequired` and stream nothing. That is a capture problem, not a display problem, and this tool does not address it.
 
-**Dummy plugs lie about 4K.** Many advertise 4K60 but only offer it as YCbCr 4:2:0, with RGB capped at 4K30 by a 297 MHz TMDS limit. Linux does not expose 4:2:0-only modes, so the driver never offers 4K60. Check `remoteplay-display doctor` for what your plug actually exposes before assuming.
+**Dummy plugs lie about 4K.** Many advertise 4K60 but only offer it as YCbCr 4:2:0, with RGB capped at 4K30 by a 297 MHz TMDS limit. Linux does not expose 4:2:0-only modes, so the driver never offers 4K60. Check `doctor` for what your plug actually exposes before assuming.
 
 **Sunshine/Moonlight sessions are not detected**, since they don't create the Steam null sink. Sunshine's `global_prep_cmd` can call `remoteplay-display on` and `off` instead.
-
-## License
-
-GPL-3.0
