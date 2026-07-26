@@ -1,0 +1,14 @@
+[Unit]
+Description=Route Steam Remote Play sessions to the dummy HDMI output
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/remoteplay-display watch
+Restart=always
+RestartSec=3
+Slice=background.slice
+
+[Install]
+WantedBy=graphical-session.target

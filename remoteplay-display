@@ -1,0 +1,784 @@
+#!/usr/bin/env python3
+"""Route Steam Remote Play sessions to a dummy HDMI output on KDE Plasma Wayland."""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import fcntl
+import json
+import os
+import re
+import selectors
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from pathlib import Path
+
+APP = "remoteplay-display"
+STREAM_SINK = "steam-streaming-playback"
+
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+CONFIG_PATH = CONFIG_HOME / APP / "config.ini"
+STATE_DIR = STATE_HOME / APP
+STATE_PATH = STATE_DIR / "state.json"
+LOCK_PATH = STATE_DIR / "lock"
+LOG_PATH = STATE_DIR / f"{APP}.log"
+LOG_MAX_BYTES = 2 * 1024 * 1024
+
+DEFAULTS = {
+    "dummy": "HDMI-A-2",
+    "mode": "auto",
+    "fallback_mode": "1920x1080@120",
+    "steam_log": "~/.steam/steam/logs/streaming_log.txt",
+    "capture_hint_max_age": "120",
+    "auto": "true",
+    "inhibit_idle": "true",
+    "settle_timeout": "10.0",
+}
+
+ROTATION_NAMES = {1: "none", 2: "left", 4: "inverted", 8: "right"}
+
+
+def log(message: str) -> None:
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{stamp}] {message}"
+    print(line, file=sys.stderr, flush=True)
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > LOG_MAX_BYTES:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.previous"))
+        with LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+
+
+def load_config() -> configparser.SectionProxy:
+    parser = configparser.ConfigParser()
+    parser["remoteplay"] = dict(DEFAULTS)
+    if CONFIG_PATH.exists():
+        parser.read(CONFIG_PATH, encoding="utf-8")
+    return parser["remoteplay"]
+
+
+@dataclass(frozen=True)
+class Mode:
+    id: str
+    width: int
+    height: int
+    refresh: float
+
+    def __str__(self) -> str:
+        return f"{self.width}x{self.height}@{self.refresh:.2f}"
+
+
+@dataclass
+class Output:
+    name: str
+    connected: bool
+    enabled: bool
+    priority: int
+    pos: tuple[int, int]
+    scale: float
+    rotation: int
+    modes: tuple[Mode, ...]
+    current_mode_id: str
+
+    @property
+    def current_mode(self) -> Mode | None:
+        return next((m for m in self.modes if m.id == self.current_mode_id), None)
+
+    def match_mode(self, width: int, height: int, refresh: float) -> Mode | None:
+        """Pick the mode with the requested pixel size whose refresh rate is closest."""
+        exact = [m for m in self.modes if m.width == width and m.height == height]
+        if not exact:
+            return None
+        return min(exact, key=lambda m: abs(m.refresh - refresh))
+
+
+@dataclass
+class Target:
+    name: str
+    enabled: bool
+    mode_id: str | None = None
+    pos: tuple[int, int] | None = None
+    scale: float | None = None
+    rotation: int | None = None
+    priority: int | None = None
+
+
+class KScreenError(RuntimeError):
+    pass
+
+
+def read_outputs(retries: int = 3) -> dict[str, Output]:
+    last_error = ""
+    for attempt in range(retries):
+        result = subprocess.run(
+            ["kscreen-doctor", "--json"], capture_output=True, text=True, timeout=20
+        )
+        if result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError as exc:
+                last_error = f"malformed JSON: {exc}"
+            else:
+                return {o.name: o for o in (_parse_output(raw) for raw in payload["outputs"])}
+        else:
+            last_error = (result.stderr or result.stdout).strip()
+        if attempt + 1 < retries:
+            time.sleep(0.4)
+    raise KScreenError(f"kscreen-doctor --json failed: {last_error}")
+
+
+def _parse_output(raw: dict) -> Output:
+    modes = tuple(
+        Mode(
+            id=str(m["id"]),
+            width=int(m["size"]["width"]),
+            height=int(m["size"]["height"]),
+            refresh=float(m["refreshRate"]),
+        )
+        for m in raw.get("modes", [])
+    )
+    pos = raw.get("pos") or {}
+    return Output(
+        name=raw["name"],
+        connected=bool(raw.get("connected")),
+        enabled=bool(raw.get("enabled")),
+        priority=int(raw.get("priority") or 0),
+        pos=(int(pos.get("x", 0)), int(pos.get("y", 0))),
+        scale=float(raw.get("scale") or 1.0),
+        rotation=int(raw.get("rotation") or 1),
+        modes=modes,
+        current_mode_id=str(raw.get("currentModeId") or ""),
+    )
+
+
+def apply_targets(targets: list[Target]) -> None:
+    """Push every output change through kscreen-doctor as one atomic transaction."""
+    args: list[str] = []
+    for target in targets:
+        if not target.enabled:
+            args.append(f"output.{target.name}.disable")
+    for target in targets:
+        if not target.enabled:
+            continue
+        if target.mode_id is not None:
+            args.append(f"output.{target.name}.mode.{target.mode_id}")
+        if target.pos is not None:
+            args.append(f"output.{target.name}.position.{target.pos[0]},{target.pos[1]}")
+        if target.scale is not None:
+            args.append(f"output.{target.name}.scale.{target.scale:g}")
+        if target.rotation in ROTATION_NAMES and target.rotation != 1:
+            args.append(f"output.{target.name}.rotation.{ROTATION_NAMES[target.rotation]}")
+        if target.priority is not None and target.priority > 0:
+            args.append(f"output.{target.name}.priority.{target.priority}")
+        args.append(f"output.{target.name}.enable")
+    if not args:
+        return
+    log(f"kscreen-doctor {' '.join(args)}")
+    result = subprocess.run(
+        ["kscreen-doctor", *args], capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise KScreenError((result.stderr or result.stdout).strip())
+
+
+def wait_until(predicate, timeout: float) -> dict[str, Output] | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            snapshot = read_outputs(retries=1)
+        except KScreenError:
+            snapshot = None
+        if snapshot and predicate(snapshot):
+            return snapshot
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
+
+
+def read_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def write_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_PATH)
+
+
+def clear_state() -> None:
+    STATE_PATH.unlink(missing_ok=True)
+
+
+class StateLock:
+    def __enter__(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._handle = LOCK_PATH.open("w")
+        fcntl.flock(self._handle, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_exc):
+        fcntl.flock(self._handle, fcntl.LOCK_UN)
+        self._handle.close()
+        return False
+
+
+def sink_present() -> bool:
+    try:
+        result = subprocess.run(
+            ["pactl", "list", "short", "sinks"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and STREAM_SINK in result.stdout
+
+
+CAPTURE_RE = re.compile(
+    r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\[[\d.]+\] "
+    r"Maximum capture: (\d+)x(\d+) ([\d.]+) FPS"
+)
+
+
+def latest_capture_hint(cfg) -> tuple[int, int, float] | None:
+    """Read the client's advertised capture ceiling from Steam's streaming log."""
+    path = Path(os.path.expanduser(cfg["steam_log"]))
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 512 * 1024))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    max_age = timedelta(seconds=float(cfg["capture_hint_max_age"]))
+    for line in reversed(tail.splitlines()):
+        match = CAPTURE_RE.match(line)
+        if not match:
+            continue
+        stamp = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        if datetime.now() - stamp > max_age:
+            return None
+        return int(match.group(2)), int(match.group(3)), float(match.group(4))
+    return None
+
+
+def parse_mode_spec(spec: str) -> tuple[int, int, float] | None:
+    match = re.fullmatch(r"\s*(\d+)x(\d+)(?:@([\d.]+))?\s*", spec)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), float(match.group(3) or 60.0)
+
+
+def choose_dummy_mode(dummy: Output, cfg) -> tuple[Mode, str]:
+    """Select the dummy mode that best feeds the connected client, refresh rate first."""
+    spec = cfg["mode"].strip()
+    if spec.lower() != "auto":
+        wanted = parse_mode_spec(spec)
+        if wanted:
+            mode = dummy.match_mode(*wanted)
+            if mode:
+                return mode, f"configured {spec}"
+        log(f"configured mode {spec!r} is not offered by {dummy.name}; falling back")
+
+    hint = latest_capture_hint(cfg)
+    if hint:
+        cw, ch, cfps = hint
+        client_aspect = cw / ch
+        best = max(
+            dummy.modes,
+            key=lambda m: (
+                1 if m.refresh >= cfps - 1.0 else 0,
+                -round(abs(m.width / m.height - client_aspect), 2),
+                1 if (m.width >= cw and m.height >= ch) else 0,
+                -abs(m.width * m.height - cw * ch),
+                m.refresh,
+            ),
+        )
+        return best, f"client wants {cw}x{ch}@{cfps:g}"
+
+    wanted = parse_mode_spec(cfg["fallback_mode"])
+    if wanted:
+        mode = dummy.match_mode(*wanted)
+        if mode:
+            return mode, f"fallback {cfg['fallback_mode']}"
+    best = max(dummy.modes, key=lambda m: (m.refresh, m.width * m.height))
+    return best, "highest refresh available"
+
+
+def start_inhibitor(cfg) -> int | None:
+    if cfg["inhibit_idle"].strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
+    try:
+        child = subprocess.Popen(
+            [os.path.abspath(__file__), "_inhibit"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log(f"could not start idle inhibitor: {exc}")
+        return None
+    return child.pid
+
+
+def stop_inhibitor(pid: int | None) -> None:
+    if not pid:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        log(f"could not stop idle inhibitor {pid}: {exc}")
+
+
+def activate(cfg, owner: str) -> bool:
+    with StateLock():
+        state = read_state()
+        if state.get("active"):
+            log(f"already in remote mode (owner={state.get('owner')})")
+            return True
+
+        outputs = read_outputs()
+        dummy_name = cfg["dummy"].strip()
+        dummy = outputs.get(dummy_name)
+        if dummy is None or not dummy.connected:
+            log(f"dummy output {dummy_name!r} is not connected; refusing to switch")
+            return False
+        if not dummy.modes:
+            log(f"dummy output {dummy_name!r} reports no modes; refusing to switch")
+            return False
+
+        mode, reason = choose_dummy_mode(dummy, cfg)
+        snapshot = [
+            {
+                "name": o.name,
+                "enabled": o.enabled,
+                "priority": o.priority,
+                "pos": list(o.pos),
+                "scale": o.scale,
+                "rotation": o.rotation,
+                "mode": _mode_record(o),
+            }
+            for o in outputs.values()
+            if o.connected
+        ]
+
+        targets = [Target(name=dummy_name, enabled=True, mode_id=mode.id, pos=(0, 0),
+                          scale=1.0, rotation=1, priority=1)]
+        targets += [
+            Target(name=o.name, enabled=False)
+            for o in outputs.values()
+            if o.name != dummy_name and o.enabled
+        ]
+
+        log(f"switching to {dummy_name} @ {mode} ({reason}); "
+            f"disabling {[t.name for t in targets if not t.enabled] or 'nothing'}")
+        write_state({
+            "active": True,
+            "owner": owner,
+            "dummy": dummy_name,
+            "mode": str(mode),
+            "since": datetime.now().isoformat(timespec="seconds"),
+            "snapshot": snapshot,
+            "inhibitor_pid": None,
+        })
+        try:
+            apply_targets(targets)
+        except KScreenError as exc:
+            log(f"switch failed: {exc}; restoring")
+            clear_state()
+            _restore(snapshot, dummy_name, float(cfg["settle_timeout"]))
+            return False
+
+        settled = wait_until(
+            lambda snap: _only_enabled(snap, dummy_name)
+            and _mode_matches(snap.get(dummy_name), mode),
+            float(cfg["settle_timeout"]),
+        )
+        if settled is None:
+            log("WARNING: display state did not settle as expected; retrying once")
+            try:
+                apply_targets(targets)
+            except KScreenError as exc:
+                log(f"retry failed: {exc}")
+            settled = wait_until(
+                lambda snap: _only_enabled(snap, dummy_name),
+                float(cfg["settle_timeout"]),
+            )
+            if settled is None:
+                log("ERROR: could not confirm dummy-only layout")
+
+        state = read_state()
+        state["inhibitor_pid"] = start_inhibitor(cfg)
+        write_state(state)
+        log(f"remote mode active on {dummy_name} @ {mode}")
+        return True
+
+
+def _mode_record(output: Output) -> dict | None:
+    mode = output.current_mode
+    if mode is None:
+        return None
+    return {"width": mode.width, "height": mode.height, "refresh": mode.refresh}
+
+
+def _only_enabled(snapshot: dict[str, Output], name: str) -> bool:
+    enabled = {o.name for o in snapshot.values() if o.enabled}
+    return enabled == {name}
+
+
+def _mode_matches(output: Output | None, mode: Mode) -> bool:
+    if output is None:
+        return False
+    current = output.current_mode
+    return bool(current and current.width == mode.width and current.height == mode.height)
+
+
+def deactivate(cfg, force: bool = False) -> bool:
+    with StateLock():
+        state = read_state()
+        if not state.get("active"):
+            if force:
+                log("no saved remote-mode state; nothing to restore")
+            return True
+        stop_inhibitor(state.get("inhibitor_pid"))
+        ok = _restore(state.get("snapshot") or [], state.get("dummy", ""),
+                      float(cfg["settle_timeout"]))
+        clear_state()
+        log("desktop layout restored" if ok else "desktop layout restore incomplete")
+        return ok
+
+
+def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bool:
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        log(f"cannot read outputs while restoring: {exc}")
+        return False
+
+    targets: list[Target] = []
+    for entry in snapshot:
+        output = outputs.get(entry["name"])
+        if output is None or not output.connected:
+            log(f"skipping {entry['name']}: no longer connected")
+            continue
+        if not entry["enabled"]:
+            targets.append(Target(name=entry["name"], enabled=False))
+            continue
+        mode_id = None
+        record = entry.get("mode")
+        if record:
+            mode = output.match_mode(record["width"], record["height"], record["refresh"])
+            mode_id = mode.id if mode else None
+            if mode_id is None:
+                log(f"{entry['name']}: saved mode {record['width']}x{record['height']} "
+                    f"unavailable, leaving current mode")
+        targets.append(Target(
+            name=entry["name"],
+            enabled=True,
+            mode_id=mode_id,
+            pos=tuple(entry["pos"]),
+            scale=entry.get("scale"),
+            rotation=entry.get("rotation"),
+            priority=entry.get("priority"),
+        ))
+
+    if not any(t.enabled for t in targets):
+        log("WARNING: no saved output is connected; keeping the dummy enabled")
+        targets = [t for t in targets if t.name != dummy_name]
+        if dummy_name in outputs:
+            targets.append(Target(name=dummy_name, enabled=True))
+
+    if not targets:
+        return True
+    try:
+        apply_targets(targets)
+    except KScreenError as exc:
+        log(f"restore failed: {exc}")
+        return False
+
+    expected = {t.name for t in targets if t.enabled}
+    settled = wait_until(
+        lambda snap: expected <= {o.name for o in snap.values() if o.enabled},
+        settle_timeout,
+    )
+    return settled is not None
+
+
+def cmd_on(cfg, _args) -> int:
+    return 0 if activate(cfg, owner="manual") else 1
+
+
+def cmd_off(cfg, _args) -> int:
+    return 0 if deactivate(cfg, force=True) else 1
+
+
+def cmd_toggle(cfg, args) -> int:
+    return cmd_off(cfg, args) if read_state().get("active") else cmd_on(cfg, args)
+
+
+def cmd_status(cfg, _args) -> int:
+    state = read_state()
+    session = sink_present()
+    print(f"mode:      {'REMOTE' if state.get('active') else 'desktop'}")
+    if state.get("active"):
+        print(f"owner:     {state.get('owner')}")
+        print(f"dummy:     {state.get('dummy')} @ {state.get('mode')}")
+        print(f"since:     {state.get('since')}")
+    print(f"session:   {'streaming' if session else 'idle'} ({STREAM_SINK})")
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        print(f"outputs:   unavailable ({exc})")
+        return 1
+    print("outputs:")
+    for output in sorted(outputs.values(), key=lambda o: (not o.enabled, o.priority, o.name)):
+        flag = "on " if output.enabled else "off"
+        current = output.current_mode
+        detail = f"{current}" if current else "-"
+        tag = "  <- dummy" if output.name == cfg["dummy"].strip() else ""
+        print(f"  {flag} {output.name:<10} {detail:<18} pos={output.pos[0]},{output.pos[1]} "
+              f"prio={output.priority}{tag}")
+    return 0
+
+
+def cmd_doctor(cfg, _args) -> int:
+    problems = 0
+    print(f"config:    {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'defaults'})")
+    print(f"state:     {STATE_PATH}")
+    print(f"log:       {LOG_PATH}")
+
+    for tool in ("kscreen-doctor", "pactl"):
+        found = subprocess.run(["which", tool], capture_output=True, text=True).returncode == 0
+        print(f"tool:      {tool} {'ok' if found else 'MISSING'}")
+        problems += 0 if found else 1
+
+    dummy_name = cfg["dummy"].strip()
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        print(f"outputs:   FAILED ({exc})")
+        return 1
+
+    print("connectors:")
+    for output in outputs.values():
+        name = edid_product_name(output.name) or "-"
+        mark = "  <- configured dummy" if output.name == dummy_name else ""
+        state = "connected" if output.connected else "disconnected"
+        print(f"  {output.name:<10} {state:<13} edid={name!r}{mark}")
+
+    dummy = outputs.get(dummy_name)
+    if dummy is None or not dummy.connected:
+        print(f"dummy:     NOT CONNECTED ({dummy_name}) - fix 'dummy' in {CONFIG_PATH}")
+        problems += 1
+    else:
+        mode, reason = choose_dummy_mode(dummy, cfg)
+        print(f"dummy:     {dummy_name} ok, {len(dummy.modes)} modes")
+        print(f"selection: {mode} ({reason})")
+
+    steam_log = Path(os.path.expanduser(cfg["steam_log"]))
+    print(f"steam log: {steam_log} {'ok' if steam_log.exists() else 'MISSING'}")
+    hint = latest_capture_hint(cfg)
+    print(f"hint:      {hint if hint else 'none recent'}")
+
+    unit = subprocess.run(
+        ["systemctl", "--user", "is-active", f"{APP}.service"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    print(f"service:   {APP}.service is {unit or 'unknown'}")
+    problems += 0 if unit == "active" else 1
+
+    print(f"result:    {'all good' if problems == 0 else f'{problems} problem(s)'}")
+    return 0 if problems == 0 else 1
+
+
+def edid_product_name(connector: str) -> str | None:
+    """Pull the display product name descriptor out of the connector's raw EDID."""
+    for card in sorted(Path("/sys/class/drm").glob(f"card*-{connector}")):
+        try:
+            data = (card / "edid").read_bytes()
+        except OSError:
+            continue
+        if len(data) < 128:
+            continue
+        for offset in range(54, 126, 18):
+            block = data[offset:offset + 18]
+            if block[0:3] == b"\x00\x00\x00" and block[3] == 0xFC:
+                text = block[5:18].split(b"\n")[0]
+                return text.decode("ascii", "replace").strip()
+    return None
+
+
+def cmd_inhibit(_cfg, _args) -> int:
+    holds = []
+    try:
+        import dbus
+
+        session = dbus.SessionBus()
+        for path in ("/org/freedesktop/ScreenSaver", "/ScreenSaver"):
+            try:
+                obj = session.get_object("org.freedesktop.ScreenSaver", path)
+                holds.append(obj.Inhibit(
+                    APP, "Steam Remote Play session",
+                    dbus_interface="org.freedesktop.ScreenSaver",
+                ))
+                break
+            except dbus.DBusException:
+                continue
+        system = dbus.SystemBus()
+        login1 = system.get_object("org.freedesktop.login1", "/org/freedesktop/login1")
+        holds.append(login1.Inhibit(
+            "idle:sleep", APP, "Steam Remote Play session", "block",
+            dbus_interface="org.freedesktop.login1.Manager",
+        ))
+    except Exception as exc:
+        log(f"dbus inhibit unavailable ({exc}); falling back to systemd-inhibit")
+        os.execvp("systemd-inhibit", [
+            "systemd-inhibit", "--what=idle:sleep", f"--who={APP}",
+            "--why=Steam Remote Play session", "--mode=block", "sleep", "infinity",
+        ])
+
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+    while True:
+        signal.pause()
+
+
+class _Stopped(Exception):
+    pass
+
+
+def cmd_watch(cfg, _args) -> int:
+    auto = cfg["auto"].strip().lower() in {"1", "true", "yes", "on"}
+    log(f"watching for {STREAM_SINK} (auto={'on' if auto else 'off'}, dummy={cfg['dummy']})")
+
+    def _stop(*_signal):
+        raise _Stopped()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    try:
+        return _watch_loop(cfg, auto)
+    except _Stopped:
+        log("stopping; releasing any layout this daemon applied")
+        state = read_state()
+        if state.get("active") and state.get("owner") == "auto":
+            deactivate(cfg)
+        return 0
+
+
+def _watch_loop(cfg, auto: bool) -> int:
+    _recover_stale_state(cfg)
+    known = sink_present()
+    log(f"initial session state: {'streaming' if known else 'idle'}")
+
+    while True:
+        proc = subprocess.Popen(
+            ["pactl", "subscribe"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        try:
+            known = _consume_events(cfg, proc, auto, known)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        log("pactl subscribe ended; reconnecting in 3s")
+        time.sleep(3)
+
+
+def _consume_events(cfg, proc, auto: bool, known: bool) -> bool:
+    """Follow pactl's event stream, reconciling on every sink change and once a second."""
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    pending_until = None
+    while proc.poll() is None:
+        events = selector.select(timeout=1.0)
+        for _key, _mask in events:
+            line = proc.stdout.readline()
+            if not line:
+                return known
+            if "sink" in line or "server" in line:
+                pending_until = time.monotonic() + 0.4
+        if pending_until is not None and time.monotonic() < pending_until:
+            continue
+        pending_until = None
+        known = _reconcile(cfg, auto, known)
+    return known
+
+
+def _reconcile(cfg, auto: bool, known: bool) -> bool:
+    present = sink_present()
+    if present == known:
+        return known
+    log(f"session {'started' if present else 'ended'}")
+    if not auto:
+        return present
+    state = read_state()
+    if present and not state.get("active"):
+        activate(cfg, owner="auto")
+    elif not present and state.get("active") and state.get("owner") == "auto":
+        deactivate(cfg)
+    return present
+
+
+def _recover_stale_state(cfg) -> None:
+    state = read_state()
+    if state.get("active") and state.get("owner") == "auto" and not sink_present():
+        log("found stale remote-mode state from a previous run; restoring desktop")
+        deactivate(cfg)
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "on": cmd_on,
+    "off": cmd_off,
+    "toggle": cmd_toggle,
+    "watch": cmd_watch,
+    "doctor": cmd_doctor,
+    "_inhibit": cmd_inhibit,
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog=APP,
+        description="Route Steam Remote Play sessions to a dummy HDMI output.",
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="status",
+        choices=[c for c in COMMANDS if not c.startswith("_")] + ["_inhibit"],
+        help="status (default), on, off, toggle, watch, doctor",
+    )
+    args = parser.parse_args()
+    cfg = load_config()
+    try:
+        return COMMANDS[args.command](cfg, args)
+    except KScreenError as exc:
+        log(f"ERROR: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
