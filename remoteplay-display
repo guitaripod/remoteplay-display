@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route Steam Remote Play sessions to a dummy HDMI output on KDE Plasma Wayland."""
+"""Route remote play sessions to a dummy HDMI output on KDE Plasma Wayland."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULTS = {
     "dummy": "HDMI-A-2",
     "mode": "auto",
+    "min_mode": "1920x1080",
     "fallback_mode": "1920x1080@120",
     "steam_log": "~/.steam/steam/logs/streaming_log.txt",
     "capture_hint_max_age": "120",
@@ -284,7 +285,44 @@ def parse_mode_spec(spec: str) -> tuple[int, int, float] | None:
     return int(match.group(1)), int(match.group(2)), float(match.group(3) or 60.0)
 
 
-def choose_dummy_mode(dummy: Output, cfg) -> tuple[Mode, str]:
+def sunshine_client_hint() -> tuple[int, int, float] | None:
+    """Read the stream geometry Sunshine exports to its prep commands."""
+    try:
+        width = int(os.environ["SUNSHINE_CLIENT_WIDTH"])
+        height = int(os.environ["SUNSHINE_CLIENT_HEIGHT"])
+    except (KeyError, ValueError):
+        return None
+    try:
+        fps = float(os.environ.get("SUNSHINE_CLIENT_FPS") or 60.0)
+    except ValueError:
+        fps = 60.0
+    return width, height, fps
+
+
+def client_hint(cfg, args) -> tuple[int, int, float] | None:
+    """Resolve the client's geometry: explicit flag, then Sunshine's env, then Steam's log."""
+    spec = getattr(args, "client", None)
+    if spec:
+        parsed = parse_mode_spec(spec)
+        if parsed:
+            return parsed
+        log(f"ignoring unparseable --client {spec!r}")
+    return sunshine_client_hint() or latest_capture_hint(cfg)
+
+
+def cadence_error(refresh: float, client_fps: float) -> float:
+    """How far this refresh rate is from an whole-number multiple of the client's frame rate.
+
+    Capture samples the scanout, so a non-integer ratio delivers frames of uneven age no matter
+    how fast either side runs: 119.88 Hz feeding a 90 fps client repeats every fourth frame.
+    """
+    if client_fps <= 0:
+        return 0.0
+    ratio = refresh / client_fps
+    return abs(ratio - round(ratio))
+
+
+def choose_dummy_mode(dummy: Output, cfg, hint=None) -> tuple[Mode, str]:
     """Select the dummy mode that best feeds the connected client, refresh rate first."""
     spec = cfg["mode"].strip()
     if spec.lower() != "auto":
@@ -295,15 +333,18 @@ def choose_dummy_mode(dummy: Output, cfg) -> tuple[Mode, str]:
                 return mode, f"configured {spec}"
         log(f"configured mode {spec!r} is not offered by {dummy.name}; falling back")
 
-    hint = latest_capture_hint(cfg)
     if hint:
         cw, ch, cfps = hint
         client_aspect = cw / ch
+        floor = parse_mode_spec(cfg["min_mode"])
+        min_pixels = floor[0] * floor[1] if floor else 0
         best = max(
             dummy.modes,
             key=lambda m: (
                 1 if m.refresh >= cfps - 1.0 else 0,
                 -round(abs(m.width / m.height - client_aspect), 2),
+                -round(cadence_error(m.refresh, cfps), 2),
+                1 if m.width * m.height >= min_pixels else 0,
                 1 if (m.width >= cw and m.height >= ch) else 0,
                 -abs(m.width * m.height - cw * ch),
                 m.refresh,
@@ -348,7 +389,7 @@ def stop_inhibitor(pid: int | None) -> None:
         log(f"could not stop idle inhibitor {pid}: {exc}")
 
 
-def activate(cfg, owner: str) -> bool:
+def activate(cfg, owner: str, hint=None) -> bool:
     with StateLock():
         state = read_state()
         if state.get("active"):
@@ -365,7 +406,7 @@ def activate(cfg, owner: str) -> bool:
             log(f"dummy output {dummy_name!r} reports no modes; refusing to switch")
             return False
 
-        mode, reason = choose_dummy_mode(dummy, cfg)
+        mode, reason = choose_dummy_mode(dummy, cfg, hint)
         snapshot = [
             {
                 "name": o.name,
@@ -451,12 +492,15 @@ def _mode_matches(output: Output | None, mode: Mode) -> bool:
     return bool(current and current.width == mode.width and current.height == mode.height)
 
 
-def deactivate(cfg, force: bool = False) -> bool:
+def deactivate(cfg, force: bool = False, owner: str | None = None) -> bool:
     with StateLock():
         state = read_state()
         if not state.get("active"):
             if force:
                 log("no saved remote-mode state; nothing to restore")
+            return True
+        if owner is not None and state.get("owner") != owner:
+            log(f"layout is owned by {state.get('owner')!r}, not {owner!r}; leaving it alone")
             return True
         stop_inhibitor(state.get("inhibitor_pid"))
         ok = _restore(state.get("snapshot") or [], state.get("dummy", ""),
@@ -522,12 +566,14 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
     return settled is not None
 
 
-def cmd_on(cfg, _args) -> int:
-    return 0 if activate(cfg, owner="manual") else 1
+def cmd_on(cfg, args) -> int:
+    owner = (getattr(args, "owner", None) or "manual").strip()
+    return 0 if activate(cfg, owner=owner, hint=client_hint(cfg, args)) else 1
 
 
-def cmd_off(cfg, _args) -> int:
-    return 0 if deactivate(cfg, force=True) else 1
+def cmd_off(cfg, args) -> int:
+    owner = (getattr(args, "owner", None) or "").strip() or None
+    return 0 if deactivate(cfg, force=True, owner=owner) else 1
 
 
 def cmd_toggle(cfg, args) -> int:
@@ -559,7 +605,7 @@ def cmd_status(cfg, _args) -> int:
     return 0
 
 
-def cmd_doctor(cfg, _args) -> int:
+def cmd_doctor(cfg, args) -> int:
     problems = 0
     print(f"config:    {CONFIG_PATH} ({'present' if CONFIG_PATH.exists() else 'defaults'})")
     print(f"state:     {STATE_PATH}")
@@ -589,14 +635,15 @@ def cmd_doctor(cfg, _args) -> int:
         print(f"dummy:     NOT CONNECTED ({dummy_name}) - fix 'dummy' in {CONFIG_PATH}")
         problems += 1
     else:
-        mode, reason = choose_dummy_mode(dummy, cfg)
+        hint = client_hint(cfg, args)
+        mode, reason = choose_dummy_mode(dummy, cfg, hint)
         print(f"dummy:     {dummy_name} ok, {len(dummy.modes)} modes")
         print(f"selection: {mode} ({reason})")
 
     steam_log = Path(os.path.expanduser(cfg["steam_log"]))
     print(f"steam log: {steam_log} {'ok' if steam_log.exists() else 'MISSING'}")
-    hint = latest_capture_hint(cfg)
-    print(f"hint:      {hint if hint else 'none recent'}")
+    print(f"hint:      {latest_capture_hint(cfg) or 'none recent'}")
+    print(f"sunshine:  {sunshine_integration_status()}")
 
     unit = subprocess.run(
         ["systemctl", "--user", "is-active", f"{APP}.service"],
@@ -607,6 +654,28 @@ def cmd_doctor(cfg, _args) -> int:
 
     print(f"result:    {'all good' if problems == 0 else f'{problems} problem(s)'}")
     return 0 if problems == 0 else 1
+
+
+def sunshine_integration_status() -> str:
+    """Report whether Sunshine's prep commands hand sessions to this tool."""
+    conf = CONFIG_HOME / "sunshine" / "sunshine.conf"
+    if not conf.exists():
+        return "not installed"
+    try:
+        text = conf.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"unreadable ({exc})"
+    prep = next(
+        (line for line in text.splitlines() if line.strip().startswith("global_prep_cmd")), ""
+    )
+    if APP not in prep:
+        return f"installed, global_prep_cmd NOT wired - see {conf}"
+    output = next(
+        (line for line in text.splitlines() if line.strip().startswith("output_name")), ""
+    )
+    index = output.split("=", 1)[1].strip() if "=" in output else "unset"
+    warn = "" if index == "0" else f"; WARNING output_name={index}, expected 0"
+    return f"wired via global_prep_cmd{warn}"
 
 
 def edid_product_name(connector: str) -> str | None:
@@ -770,7 +839,7 @@ COMMANDS = {
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog=APP,
-        description="Route Steam Remote Play sessions to a dummy HDMI output.",
+        description="Route remote play sessions to a dummy HDMI output.",
     )
     parser.add_argument(
         "command",
@@ -778,6 +847,16 @@ def main() -> int:
         default="status",
         choices=[c for c in COMMANDS if not c.startswith("_")] + ["_inhibit"],
         help="status (default), on, off, toggle, watch, doctor",
+    )
+    parser.add_argument(
+        "--client",
+        metavar="WxH[@FPS]",
+        help="client geometry to pick the dummy mode for; overrides autodetection",
+    )
+    parser.add_argument(
+        "--owner",
+        metavar="NAME",
+        help="tag the layout (on) or only restore a layout with this tag (off)",
     )
     args = parser.parse_args()
     cfg = load_config()

@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply the synthetic EDID to dummy connector %i
+Documentation=https://github.com/guitaripod/remoteplay-display
+Requires=sys-kernel-debug.mount
+After=sys-kernel-debug.mount
+Before=display-manager.service
+ConditionPathExistsGlob=/sys/kernel/debug/dri/*/%i/edid_override
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/dummy-edid install --connector %i --source /lib/firmware/edid/remoteplay-dummy.edid --no-reprobe
+
+[Install]
+WantedBy=graphical.target

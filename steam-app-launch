@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+APPID="${1:-}"
+START_TIMEOUT="${2:-180}"
+EXIT_GRACE="${3:-20}"
+POLL=2
+
+if [ -z "$APPID" ]; then
+    echo "usage: steam-app-launch <appid> [start-timeout] [exit-grace]" >&2
+    exit 2
+fi
+
+## True while the game's reaper is alive. Steam runs an install-script evaluator under the
+## same "SteamLaunch AppId=<id>" banner before the game itself, distinguished only by the
+## Install=1 argument, so that one must not count as the game.
+running() {
+    pgrep -a -f "SteamLaunch AppId=${APPID}" 2>/dev/null | grep -qv "Install=1"
+}
+
+## Block until the game is up, or fail after START_TIMEOUT so a broken launch cannot hang forever.
+wait_for_start() {
+    local deadline=$((SECONDS + START_TIMEOUT))
+    until running; do
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "steam app ${APPID} did not start within ${START_TIMEOUT}s" >&2
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+## Block until the game has been absent for EXIT_GRACE seconds straight. Proton hands off between
+## processes during startup, so a single missed poll must not be mistaken for the game exiting.
+wait_for_exit() {
+    local absent=0
+    while [ "$absent" -lt "$EXIT_GRACE" ]; do
+        sleep "$POLL"
+        if running; then
+            absent=0
+        else
+            absent=$((absent + POLL))
+        fi
+    done
+}
+
+steam "steam://rungameid/${APPID}" >/dev/null 2>&1 &
+
+wait_for_start || exit 1
+echo "steam app ${APPID} running; holding the session until it exits" >&2
+wait_for_exit
+echo "steam app ${APPID} exited" >&2

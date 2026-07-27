@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Build and install a synthetic EDID that gives a dummy plug the modes a streaming host needs."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+MANUFACTURER = "RPD"
+PRODUCT_NAME = "RPD Dummy"
+PRODUCT_CODE = 0x0001
+SERIAL = 0x00000000
+MANUFACTURE_WEEK = 1
+MANUFACTURE_YEAR = 2026
+SCREEN_WIDTH_MM = 520
+MAX_TMDS_MHZ = 600
+LEGACY_VSDB_MAX_TMDS_MHZ = 340
+
+SRGB_CHROMATICITY = bytes([0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54])
+
+DEBUGFS_DRI = Path("/sys/kernel/debug/dri")
+
+
+class Timing:
+    """One detailed timing descriptor, expressed the way `cvt` prints a modeline."""
+
+    def __init__(self, label, clock_khz, hactive, hsync_start, hsync_end, htotal,
+                 vactive, vsync_start, vsync_end, vtotal, hsync_pos, vsync_pos):
+        self.label = label
+        self.clock_khz = clock_khz
+        self.hactive = hactive
+        self.hblank = htotal - hactive
+        self.hfront = hsync_start - hactive
+        self.hsync = hsync_end - hsync_start
+        self.vactive = vactive
+        self.vblank = vtotal - vactive
+        self.vfront = vsync_start - vactive
+        self.vsync = vsync_end - vsync_start
+        self.hsync_pos = hsync_pos
+        self.vsync_pos = vsync_pos
+
+    @property
+    def refresh(self) -> float:
+        return self.clock_khz * 1000 / ((self.hactive + self.hblank) * (self.vactive + self.vblank))
+
+    @property
+    def size_mm(self) -> tuple[int, int]:
+        """Physical size implied by this mode's aspect ratio, which EDID expects per descriptor."""
+        return SCREEN_WIDTH_MM, round(SCREEN_WIDTH_MM * self.vactive / self.hactive)
+
+    def encode(self) -> bytes:
+        pixel_clock = round(self.clock_khz / 10)
+        if not 0 < pixel_clock <= 0xFFFF:
+            raise ValueError(f"{self.label}: pixel clock out of EDID range")
+        width_mm, height_mm = self.size_mm
+        flags = 0x18 | (0x04 if self.vsync_pos else 0) | (0x02 if self.hsync_pos else 0)
+        return bytes([
+            pixel_clock & 0xFF,
+            pixel_clock >> 8,
+            self.hactive & 0xFF,
+            self.hblank & 0xFF,
+            ((self.hactive >> 8) << 4) | (self.hblank >> 8),
+            self.vactive & 0xFF,
+            self.vblank & 0xFF,
+            ((self.vactive >> 8) << 4) | (self.vblank >> 8),
+            self.hfront & 0xFF,
+            self.hsync & 0xFF,
+            ((self.vfront & 0x0F) << 4) | (self.vsync & 0x0F),
+            ((self.hfront >> 8) << 6) | ((self.hsync >> 8) << 4)
+            | (((self.vfront >> 4) & 0x03) << 2) | ((self.vsync >> 4) & 0x03),
+            width_mm & 0xFF,
+            height_mm & 0xFF,
+            ((width_mm >> 8) << 4) | (height_mm >> 8),
+            0,
+            0,
+            flags,
+        ])
+
+
+TIMINGS = [
+    Timing("1920x1200@90",  297000, 1920, 2072, 2280, 2640, 1200, 1203, 1209, 1250, False, True),
+    Timing("3840x2160@60",  533280, 3840, 3888, 3920, 4000, 2160, 2163, 2168, 2222, True, False),
+    Timing("2560x1440@120", 497760, 2560, 2608, 2640, 2720, 1440, 1443, 1448, 1525, True, False),
+    Timing("1920x1080@120", 287040, 1920, 1968, 2000, 2080, 1080, 1083, 1088, 1150, True, False),
+    Timing("1920x1080@90",  265680, 1920, 2064, 2272, 2624, 1080, 1083, 1088, 1125, False, True),
+    Timing("1920x1200@89",  293700, 1920, 2072, 2280, 2640, 1200, 1203, 1209, 1250, False, True),
+    Timing("2560x1600@90",  559440, 2560, 2776, 3056, 3552, 1600, 1603, 1609, 1750, False, True),
+]
+
+BASE_BLOCK_TIMINGS = 2
+
+
+def manufacturer_id(code: str) -> bytes:
+    packed = 0
+    for letter in code:
+        packed = (packed << 5) | (ord(letter) - ord("A") + 1)
+    return bytes([packed >> 8, packed & 0xFF])
+
+
+def range_limits_descriptor() -> bytes:
+    """Required by EDID 1.3, which the HDMI specification mandates alongside an HDMI VSDB.
+
+    Bounds are deliberately wider than the timing list so the established 640x480 fallback
+    stays inside them; nothing is receiving this signal, so there is no reason to be tight.
+    """
+    vertical = [t.refresh for t in TIMINGS]
+    horizontal = [t.clock_khz / (t.hactive + t.hblank) for t in TIMINGS]
+    return bytes([
+        0, 0, 0, 0xFD, 0,
+        24,
+        int(max(vertical)) + 2,
+        15,
+        int(max(horizontal)) + 5,
+        -(-MAX_TMDS_MHZ // 10),
+        0x00, 0x0A, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
+    ])
+
+
+def text_descriptor(tag: int, text: str) -> bytes:
+    payload = text.encode("ascii")[:13]
+    payload += b"\n" if len(payload) < 13 else b""
+    payload = payload.ljust(13, b" ")
+    return bytes([0, 0, 0, tag, 0]) + payload
+
+
+def with_checksum(block: bytearray) -> bytes:
+    block[127] = (-sum(block[:127])) & 0xFF
+    return bytes(block)
+
+
+def build_base_block() -> bytes:
+    block = bytearray(128)
+    block[0:8] = bytes([0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00])
+    block[8:10] = manufacturer_id(MANUFACTURER)
+    block[10:12] = PRODUCT_CODE.to_bytes(2, "little")
+    block[12:16] = SERIAL.to_bytes(4, "little")
+    block[16] = MANUFACTURE_WEEK
+    block[17] = MANUFACTURE_YEAR - 1990
+    block[18], block[19] = 1, 3
+    block[20] = 0x80
+    block[21] = round(TIMINGS[0].size_mm[0] / 10)
+    block[22] = round(TIMINGS[0].size_mm[1] / 10)
+    block[23] = 120
+    block[24] = 0x06
+    block[25:35] = SRGB_CHROMATICITY
+    block[35] = 0x20
+    for slot in range(8):
+        block[38 + slot * 2] = 0x01
+        block[39 + slot * 2] = 0x01
+
+    for index in range(BASE_BLOCK_TIMINGS):
+        offset = 54 + index * 18
+        block[offset:offset + 18] = TIMINGS[index].encode()
+    block[90:108] = range_limits_descriptor()
+    block[108:126] = text_descriptor(0xFC, PRODUCT_NAME)
+    block[126] = 1
+    return with_checksum(block)
+
+
+def vendor_block(oui: bytes, payload: bytes) -> bytes:
+    body = oui + payload
+    return bytes([(3 << 5) | len(body)]) + body
+
+
+def build_cta_block() -> bytes:
+    """CTA-861 extension: HDMI 2.0 capability declarations plus the overflow timings.
+
+    The legacy HDMI VSDB may not advertise above 340 MHz; rates beyond that belong to the
+    HDMI Forum VSDB, which is what actually unlocks 4K60 RGB here.
+    """
+    data_blocks = b"".join([
+        vendor_block(bytes([0x03, 0x0C, 0x00]),
+                     bytes([0x10, 0x00, 0x00, LEGACY_VSDB_MAX_TMDS_MHZ // 5])),
+        vendor_block(bytes([0xD8, 0x5D, 0xC4]),
+                     bytes([0x01, MAX_TMDS_MHZ // 5, 0x80, 0x00])),
+        bytes([(7 << 5) | 2, 0x00, 0x4A]),
+    ])
+    timings = b"".join(t.encode() for t in TIMINGS[BASE_BLOCK_TIMINGS:])
+    dtd_offset = 4 + len(data_blocks)
+    if dtd_offset + len(timings) > 127:
+        raise ValueError("CTA extension overflows; drop a timing")
+
+    block = bytearray(128)
+    block[0], block[1] = 0x02, 0x03
+    block[2] = dtd_offset
+    block[3] = 0x80
+    block[4:dtd_offset] = data_blocks
+    block[dtd_offset:dtd_offset + len(timings)] = timings
+    return with_checksum(block)
+
+
+def build() -> bytes:
+    return build_base_block() + build_cta_block()
+
+
+def connector_debugfs(connector: str) -> Path:
+    matches = sorted(DEBUGFS_DRI.glob(f"*/{connector}/edid_override"))
+    if not matches:
+        raise SystemExit(f"no edid_override for {connector} under {DEBUGFS_DRI} (need root?)")
+    return matches[0]
+
+
+def reprobe(connector: str) -> None:
+    """Force a disconnect/reconnect so compositors re-enumerate modes, not just re-read the EDID.
+
+    KWin caches a connector's mode list from when the output appeared, so a bare "detect" leaves
+    it serving the pre-override modes even though the kernel already has the new ones.
+    """
+    for status in sorted(Path("/sys/class/drm").glob(f"card*-{connector}/status")):
+        status.write_text("off")
+        time.sleep(1.0)
+        status.write_text("detect")
+        time.sleep(1.0)
+
+
+def cmd_write(args) -> int:
+    data = build()
+    Path(args.out).write_bytes(data)
+    print(f"wrote {args.out} ({len(data)} bytes)")
+    return 0
+
+
+def cmd_install(args) -> int:
+    data = Path(args.source).read_bytes() if args.source else build()
+    target = connector_debugfs(args.connector)
+    target.write_bytes(data)
+    if args.no_reprobe:
+        print(f"installed {len(data)} bytes to {target} (no reprobe)")
+        return 0
+    reprobe(args.connector)
+    print(f"installed {len(data)} bytes to {target} and forced a reprobe")
+    print("NOTE: the reprobe looks like a hotplug, so KWin may rearrange your outputs.")
+    return 0
+
+
+def cmd_clear(args) -> int:
+    connector_debugfs(args.connector).write_bytes(b"")
+    reprobe(args.connector)
+    print(f"cleared EDID override on {args.connector}")
+    return 0
+
+
+def cmd_show(_args) -> int:
+    data = build()
+    for timing in TIMINGS:
+        drift = abs(timing.refresh - round(timing.refresh))
+        verdict = "exact" if drift < 1e-6 else f"OFF BY {drift:.4f} Hz"
+        print(f"  {timing.label:<16} {timing.clock_khz / 1000:7.2f} MHz  "
+              f"{timing.refresh:10.6f} Hz  {verdict}")
+    decoder = subprocess.run(["which", "edid-decode"], capture_output=True)
+    if decoder.returncode == 0:
+        print()
+        result = subprocess.run(["edid-decode"], input=data, capture_output=True)
+        sys.stdout.write(result.stdout.decode("utf-8", "replace"))
+    return 0
+
+
+COMMANDS = {"show": cmd_show, "write": cmd_write, "install": cmd_install, "clear": cmd_clear}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="dummy-edid",
+        description="Build and install a synthetic EDID for a dummy HDMI plug.",
+    )
+    parser.add_argument("command", nargs="?", default="show", choices=list(COMMANDS))
+    parser.add_argument("--connector", default="HDMI-A-2")
+    parser.add_argument("--out", default="dummy.edid")
+    parser.add_argument("--source", help="install this prebuilt blob instead of generating one")
+    parser.add_argument("--no-reprobe", action="store_true",
+                        help="skip the hotplug cycle; correct when running before the compositor")
+    args = parser.parse_args()
+    return COMMANDS[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
