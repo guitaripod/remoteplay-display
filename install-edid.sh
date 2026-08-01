@@ -12,7 +12,7 @@ fi
 
 install -Dm755 "$REPO/dummy-edid" /usr/local/bin/dummy-edid
 install -d /lib/firmware/edid
-/usr/local/bin/dummy-edid write --out /lib/firmware/edid/remoteplay-dummy.edid
+python3 "$REPO/build-dummy-modes.py" --out /lib/firmware/edid/remoteplay-dummy.edid
 chmod 644 /lib/firmware/edid/remoteplay-dummy.edid
 install -Dm644 "$REPO/remoteplay-dummy-edid@.service" \
     /etc/systemd/system/"remoteplay-dummy-edid@.service"

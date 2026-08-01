@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Rebuild the dummy EDID with the fastest 16:10 modes its TMDS ceiling allows.
+"""Rebuild the dummy EDID with one exact-cadence mode per client this host streams to.
 
 The stock synthetic EDID tops out at 2560x1600@90, which wastes a 144 Hz client.
 HDMI TMDS caps at 600 MHz without FRL, and a passive dummy plug cannot negotiate
-FRL, so every mode here is CVT reduced-blanking sized to stay under that wall.
+FRL, so every mode here is reduced-blanking sized to stay under that wall.
 """
+import argparse
 import struct
+import subprocess
+import tempfile
 from pathlib import Path
 
-SRC = Path("/lib/firmware/edid/remoteplay-dummy.edid")
-DST = Path.home() / ".local/share/remoteplay-display/dummy-fast.edid"
+GENERATOR = Path(__file__).resolve().parent / "dummy-edid"
+DST = Path("/lib/firmware/edid/remoteplay-dummy.edid")
 
 TMDS_MHZ = 600
 PANEL_MAX_NITS = 800
@@ -20,20 +23,43 @@ RANGE_MAX_H = RANGE_DESC + 8
 RANGE_MAX_CLOCK = RANGE_DESC + 9
 HF_VSDB_MAX_TMDS = 0x91 - 128
 MIN_VBLANK_SECONDS = 460e-6
+HBLANK_MIN = 160
+HBLANK_MAX = 560
+VBLANK_MAX = 400
+HBACK = 80
 
 
-def cvt_rb(hact, vact, refresh, hblank=160, hfront=48, hsync=32, vfront=3, vsync=5):
-    """CVT reduced-blanking v1 timings honouring the 460 us minimum vertical blanking."""
-    htotal = hact + hblank
-    vb = 1
-    while True:
-        pclk = htotal * (vact + vb) * refresh
-        if vb * htotal / pclk >= MIN_VBLANK_SECONDS:
-            break
-        vb += 1
-    return dict(hact=hact, vact=vact, htotal=htotal, vtotal=vact + vb, hblank=hblank,
-                vblank=vb, hfront=hfront, hsync=hsync, vfront=vfront, vsync=vsync,
-                pclk=htotal * (vact + vb) * refresh, refresh=refresh)
+def cvt_rb(hact, vact, refresh, hsync=32, vfront=3, vsync=5):
+    """Reduced-blanking timings whose refresh rate is exactly integral.
+
+    EDID stores the pixel clock in 10 kHz units, so a blanking geometry whose
+    htotal*vtotal*refresh is not a multiple of 10000 gets rounded at encode time and
+    the output scans at a slightly wrong rate. Sunshine samples the scanout on its own
+    timer, so that residue shows up as a skipped frame every few seconds no matter the
+    bitrate. Search the blanking space for the cheapest geometry that divides cleanly,
+    staying at or above the CVT-RB 160-pixel horizontal blank and the 460 us minimum
+    vertical blank.
+    """
+    best = None
+    for htotal in range(hact + HBLANK_MIN, hact + HBLANK_MAX + 1):
+        for vtotal in range(vact + 8, vact + VBLANK_MAX + 1):
+            if (vtotal - vact) / (vtotal * refresh) < MIN_VBLANK_SECONDS:
+                continue
+            pclk = htotal * vtotal * refresh
+            if pclk != int(pclk) or int(pclk) % 10_000 or pclk > TMDS_MHZ * 1e6:
+                continue
+            key = (int(pclk), abs(htotal - hact - HBLANK_MIN))
+            if best is None or key < best[0]:
+                best = (key, htotal, vtotal)
+    if best is None:
+        raise SystemExit(f"no exact-cadence timing fits {hact}x{vact}@{refresh} under "
+                         f"{TMDS_MHZ} MHz")
+    _, htotal, vtotal = best
+    hblank, vblank = htotal - hact, vtotal - vact
+    return dict(hact=hact, vact=vact, htotal=htotal, vtotal=vtotal, hblank=hblank,
+                vblank=vblank, hfront=hblank - hsync - HBACK, hsync=hsync,
+                vfront=vfront, vsync=vsync, pclk=htotal * vtotal * refresh,
+                refresh=refresh)
 
 
 def dtd(t, hmm, vmm):
@@ -97,27 +123,47 @@ def hdr_blocks(max_nits, min_nits):
 
 W10, H10 = 520, 325
 W9, H9 = 520, 292
+WIPAD, HIPAD = 520, 363
 
 MODES = [
-    (cvt_rb(2400, 1500, 144), W10, H10),
-    (cvt_rb(2560, 1600, 120), W10, H10),
+    (cvt_rb(2388, 1668, 120), WIPAD, HIPAD),
     (cvt_rb(3840, 2160, 60), W9, H9),
     (cvt_rb(2560, 1440, 120), W9, H9),
-    (cvt_rb(1920, 1200, 144), W10, H10),
+    (cvt_rb(2400, 1500, 144), W10, H10),
     (cvt_rb(1920, 1200, 120), W10, H10),
+    (cvt_rb(1920, 1200, 89), W10, H10),
     (cvt_rb(1920, 1080, 120), W9, H9),
 ]
 
 
+def pristine_base() -> bytes:
+    """Generate the stock synthetic EDID rather than reading the installed one.
+
+    The installed file is this script's own output; reading it back would insert the
+    HDR blocks a second time and shift every detailed timing.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "base.edid"
+        subprocess.run([str(GENERATOR), "write", "--out", str(out)], check=True,
+                       capture_output=True)
+        return out.read_bytes()
+
+
 def main():
-    src = bytearray(SRC.read_bytes())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, default=DST)
+    args = parser.parse_args()
+
+    src = bytearray(pristine_base())
     assert len(src) == 256, "expected a 128-byte base block plus one CTA extension"
     base, ext = bytearray(src[:128]), bytearray(src[128:])
 
     for t, _, _ in MODES:
         print(f"{t['hact']}x{t['vact']}@{t['refresh']:<4} {t['pclk']/1e6:7.2f} MHz "
-              f"{t['pclk']/t['htotal']/1e3:6.1f} kHz")
+              f"{t['pclk']/t['htotal']/1e3:6.1f} kHz  "
+              f"{t['htotal']}x{t['vtotal']} blank {t['hblank']}/{t['vblank']}")
         assert t["pclk"] / 1e6 <= TMDS_MHZ, "exceeds the 600 MHz TMDS ceiling"
+        assert int(t["pclk"]) % 10_000 == 0, "pixel clock is not exactly encodable"
 
     base[54:72] = dtd(*MODES[0])
     base[72:90] = dtd(*MODES[1])
@@ -143,9 +189,9 @@ def main():
     assert p <= 127, "too many detailed timings for one extension block"
     ext[p:127] = bytes(127 - p)
 
-    DST.parent.mkdir(parents=True, exist_ok=True)
-    DST.write_bytes(checksum(base) + checksum(ext))
-    print(f"\nwrote {DST}")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_bytes(checksum(base) + checksum(ext))
+    print(f"\nwrote {args.out}")
 
 
 if __name__ == "__main__":
