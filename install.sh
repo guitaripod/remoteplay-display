@@ -13,6 +13,7 @@ done
 mkdir -p "$BIN" "$CONFIG" "$UNITS"
 ln -sfn "$REPO/remoteplay-display" "$BIN/remoteplay-display"
 ln -sfn "$REPO/steam-app-launch" "$BIN/steam-app-launch"
+ln -sfn "$REPO/rpd-gamescope" "$BIN/rpd-gamescope"
 ln -sfn "$REPO/remoteplay-display.service" "$UNITS/remoteplay-display.service"
 
 if [ -f "$CONFIG/config.ini" ]; then

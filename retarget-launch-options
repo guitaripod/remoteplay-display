@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Point every gamescope-wrapped Steam launch option at rpd-gamescope.
+
+Static -W/-H/-r/--hdr-enabled bake one display into the launch option, so a title
+tuned for the desktop monitor streams letterboxed to the dummy and vice versa.
+rpd-gamescope resolves those flags from the live layout instead. Titles that do not
+already use gamescope are left alone: wrapping one costs a frame of latency, which is
+never worth it for a competitive game.
+
+Steam rewrites localconfig.vdf when it exits, so it must not be running.
+"""
+import argparse
+import re
+import shutil
+import sys
+from pathlib import Path
+
+CONFIGS = "/home/*/.steam/steam/userdata/*/config/localconfig.vdf"
+WRAPPER = str(Path(__file__).resolve().parent / "rpd-gamescope")
+LAUNCH_RE = re.compile(r'("LaunchOptions"\s*")([^"]*)(")')
+FLAG_RE = re.compile(r"\s*(?:-[WHr]\s+\d+|--hdr-enabled|-f)(?=\s|$)")
+ENV_RE = re.compile(r"(?:^|\s)DXVK_HDR=1(?=\s)")
+
+
+def retarget(value: str) -> str:
+    """Strip the display-specific flags from the gamescope segment of one launch option."""
+    if "gamescope" not in value or WRAPPER in value:
+        return value
+    head, sep, tail = value.partition(" -- ")
+    if not sep:
+        return value
+    head = ENV_RE.sub(" ", head)
+    head = FLAG_RE.sub("", head)
+    head = re.sub(r"(?<![-/\w])(?:rpd-)?gamescope(?![-\w])", WRAPPER, head)
+    return " ".join(f"{head} --{tail and ' ' + tail}".split())
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="write the changes")
+    parser.add_argument("paths", nargs="*", type=Path,
+                        help="localconfig.vdf files (default: every Steam user)")
+    args = parser.parse_args()
+
+    paths = args.paths or sorted(Path("/").glob(CONFIGS.lstrip("/")))
+    if not paths:
+        print("no localconfig.vdf found", file=sys.stderr)
+        return 1
+
+    changed = 0
+    for path in paths:
+        text = path.read_text(encoding="utf-8", errors="surrogateescape")
+        hits: list[tuple[str, str]] = []
+
+        def replace(match: re.Match) -> str:
+            new = retarget(match.group(2))
+            if new != match.group(2):
+                hits.append((match.group(2), new))
+            return match.group(1) + new + match.group(3)
+
+        updated = LAUNCH_RE.sub(replace, text)
+        for before, after in hits:
+            print(f"- {before}\n+ {after}\n")
+        changed += len(hits)
+        if hits and args.apply:
+            shutil.copy2(path, path.with_suffix(".vdf.rpd-backup"))
+            path.write_text(updated, encoding="utf-8", errors="surrogateescape")
+            print(f"wrote {path} (backup: {path.with_suffix('.vdf.rpd-backup')})")
+
+    print(f"{changed} launch option(s) {'updated' if args.apply else 'would change'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

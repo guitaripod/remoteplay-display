@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Launch gamescope sized to whichever display is live right now.
+#
+# A Steam launch option is fixed when the game starts but the target display is not:
+# the same title runs on the desktop monitor locally and on the streaming dummy, at
+# different sizes, refresh rates and HDR states. Steam does not expand $(...) in launch
+# options, so the resolution has to be resolved by a real process rather than a shell
+# substitution. Use in place of `gamescope`, dropping -W/-H/-r/-f/--hdr-enabled:
+#
+#   MANGOHUD_CONFIG=full rpd-gamescope --mangoapp -- obs-gamecapture %command%
+set -euo pipefail
+
+# Steam inherits the systemd user session PATH, which does not carry ~/.local/bin, so
+# neither this wrapper nor the resolver can be found by name from a launch option.
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+RESOLVER="${RPD_RESOLVER:-$HERE/remoteplay-display}"
+
+if flags=$("$RESOLVER" gamescope-args --fullscreen 2>/dev/null); then
+    :
+else
+    flags="-f"
+fi
+
+case " $flags " in
+    *" --hdr-enabled "*) export DXVK_HDR=1 ;;
+    *) unset DXVK_HDR ;;
+esac
+
+exec gamescope $flags "$@"

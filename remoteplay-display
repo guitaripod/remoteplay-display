@@ -94,6 +94,7 @@ class Output:
     modes: tuple[Mode, ...]
     current_mode_id: str
     hdr_capable: bool = False
+    hdr_enabled: bool = False
 
     @property
     def current_mode(self) -> Mode | None:
@@ -165,6 +166,7 @@ def _parse_output(raw: dict) -> Output:
         modes=modes,
         current_mode_id=str(raw.get("currentModeId") or ""),
         hdr_capable="hdr" in raw,
+        hdr_enabled=bool(raw.get("hdr")),
     )
 
 
@@ -620,6 +622,54 @@ def cmd_toggle(cfg, args) -> int:
     return cmd_off(cfg, args) if read_state().get("active") else cmd_on(cfg, args)
 
 
+def primary_output(outputs: dict[str, Output]) -> Output | None:
+    """The output a fullscreen game will land on: lowest priority among the enabled ones.
+
+    Priority survives on a disabled output, so the dummy still reports priority 1 while
+    it is dark; filtering to enabled outputs first is what makes this correct in both
+    the streaming and the desktop layout.
+    """
+    live = [o for o in outputs.values() if o.enabled]
+    if not live:
+        return None
+    return min(live, key=lambda o: (o.priority if o.priority > 0 else 1 << 30, o.name))
+
+
+def cmd_gamescope_args(cfg, args) -> int:
+    """Print the gamescope flags that make a game fill whatever display is live now.
+
+    A launch option is baked in when the game starts, but the target display is not:
+    the same title runs on the desktop monitor locally and on the dummy while
+    streaming, at different sizes, rates and HDR states. Resolving the flags at launch
+    time from the live layout lets one launch option serve both.
+    """
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        log(f"gamescope-args: {exc}; falling back to {cfg['fallback_mode']}")
+        outputs = {}
+
+    output = primary_output(outputs)
+    mode = output.current_mode if output else None
+    if mode is None:
+        wanted = parse_mode_spec(cfg["fallback_mode"])
+        if not wanted:
+            return 1
+        width, height, refresh = wanted
+        hdr = False
+    else:
+        width, height, refresh = mode.width, mode.height, mode.refresh
+        hdr = output.hdr_enabled
+
+    flags = ["-W", str(width), "-H", str(height), "-r", str(round(refresh))]
+    if hdr and not getattr(args, "no_hdr", False):
+        flags.append("--hdr-enabled")
+    if getattr(args, "fullscreen", False):
+        flags.append("-f")
+    print(" ".join(flags))
+    return 0
+
+
 def cmd_rescue(cfg, _args) -> int:
     """Light up every real monitor at its preferred mode, ignoring any saved state.
 
@@ -912,6 +962,7 @@ COMMANDS = {
     "off": cmd_off,
     "toggle": cmd_toggle,
     "rescue": cmd_rescue,
+    "gamescope-args": cmd_gamescope_args,
     "watch": cmd_watch,
     "doctor": cmd_doctor,
     "_inhibit": cmd_inhibit,
@@ -928,7 +979,17 @@ def main() -> int:
         nargs="?",
         default="status",
         choices=[c for c in COMMANDS if not c.startswith("_")] + ["_inhibit"],
-        help="status (default), on, off, toggle, rescue, watch, doctor",
+        help="status (default), on, off, toggle, rescue, gamescope-args, watch, doctor",
+    )
+    parser.add_argument(
+        "--fullscreen",
+        action="store_true",
+        help="gamescope-args: also emit -f",
+    )
+    parser.add_argument(
+        "--no-hdr",
+        action="store_true",
+        help="gamescope-args: never emit --hdr-enabled",
     )
     parser.add_argument(
         "--client",
