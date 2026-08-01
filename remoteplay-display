@@ -41,6 +41,7 @@ DEFAULTS = {
     "steam_log": "~/.steam/steam/logs/streaming_log.txt",
     "capture_hint_max_age": "120",
     "auto": "true",
+    "hdr": "false",
     "inhibit_idle": "true",
     "settle_timeout": "10.0",
 }
@@ -92,6 +93,7 @@ class Output:
     rotation: int
     modes: tuple[Mode, ...]
     current_mode_id: str
+    hdr_capable: bool = False
 
     @property
     def current_mode(self) -> Mode | None:
@@ -114,6 +116,7 @@ class Target:
     scale: float | None = None
     rotation: int | None = None
     priority: int | None = None
+    hdr: bool | None = None
 
 
 class KScreenError(RuntimeError):
@@ -161,6 +164,7 @@ def _parse_output(raw: dict) -> Output:
         rotation=int(raw.get("rotation") or 1),
         modes=modes,
         current_mode_id=str(raw.get("currentModeId") or ""),
+        hdr_capable="hdr" in raw,
     )
 
 
@@ -184,6 +188,10 @@ def apply_targets(targets: list[Target]) -> None:
         if target.priority is not None and target.priority > 0:
             args.append(f"output.{target.name}.priority.{target.priority}")
         args.append(f"output.{target.name}.enable")
+        if target.hdr is not None:
+            state = "enable" if target.hdr else "disable"
+            args.append(f"output.{target.name}.hdr.{state}")
+            args.append(f"output.{target.name}.wcg.{state}")
     if not args:
         return
     log(f"kscreen-doctor {' '.join(args)}")
@@ -418,11 +426,13 @@ def activate(cfg, owner: str, hint=None) -> bool:
                 "mode": _mode_record(o),
             }
             for o in outputs.values()
-            if o.connected
+            if o.connected and o.name != dummy_name
         ]
+        _repair_snapshot(snapshot)
 
         targets = [Target(name=dummy_name, enabled=True, mode_id=mode.id, pos=(0, 0),
-                          scale=1.0, rotation=1, priority=1)]
+                          scale=1.0, rotation=1, priority=1,
+                          hdr=_wants_hdr(cfg) if dummy.hdr_capable else None)]
         targets += [
             Target(name=o.name, enabled=False)
             for o in outputs.values()
@@ -473,6 +483,30 @@ def activate(cfg, owner: str, hint=None) -> bool:
         return True
 
 
+def _wants_hdr(cfg) -> bool:
+    """Whether the dummy should be driven in HDR.
+
+    Both ends have to agree: capturing an HDR output while the client asks for SDR
+    forces a tone-map that looks worse than either mode on its own.
+    """
+    return str(cfg.get("hdr", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _repair_snapshot(snapshot: list[dict]) -> None:
+    """Never record a desktop layout in which every real monitor is already dark.
+
+    KWin replays a saved output setup whenever the dummy is hot-plugged, and one of
+    those setups can legitimately have the real monitors disabled. Snapshotting that
+    state would make the post-session restore faithfully turn the desktop off.
+    """
+    if not snapshot or any(e["enabled"] for e in snapshot):
+        return
+    for entry in snapshot:
+        entry["enabled"] = True
+    log(f"snapshot had every non-dummy output disabled; recording "
+        f"{[e['name'] for e in snapshot]} as enabled so the restore brings them back")
+
+
 def _mode_record(output: Output) -> dict | None:
     mode = output.current_mode
     if mode is None:
@@ -519,6 +553,8 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
 
     targets: list[Target] = []
     for entry in snapshot:
+        if entry["name"] == dummy_name:
+            continue
         output = outputs.get(entry["name"])
         if output is None or not output.connected:
             log(f"skipping {entry['name']}: no longer connected")
@@ -546,9 +582,10 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
 
     if not any(t.enabled for t in targets):
         log("WARNING: no saved output is connected; keeping the dummy enabled")
-        targets = [t for t in targets if t.name != dummy_name]
         if dummy_name in outputs:
             targets.append(Target(name=dummy_name, enabled=True))
+    elif dummy_name in outputs:
+        targets.insert(0, Target(name=dummy_name, enabled=False))
 
     if not targets:
         return True
@@ -560,9 +597,12 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
 
     expected = {t.name for t in targets if t.enabled}
     settled = wait_until(
-        lambda snap: expected <= {o.name for o in snap.values() if o.enabled},
+        lambda snap: expected <= {o.name for o in snap.values() if o.enabled}
+        and dummy_name not in {o.name for o in snap.values() if o.enabled} - expected,
         settle_timeout,
     )
+    if settled is None:
+        log(f"WARNING: {dummy_name} did not settle as expected after restore")
     return settled is not None
 
 
@@ -578,6 +618,47 @@ def cmd_off(cfg, args) -> int:
 
 def cmd_toggle(cfg, args) -> int:
     return cmd_off(cfg, args) if read_state().get("active") else cmd_on(cfg, args)
+
+
+def cmd_rescue(cfg, _args) -> int:
+    """Light up every real monitor at its preferred mode, ignoring any saved state.
+
+    The escape hatch for a dark desktop: mode ids are renumbered whenever the set of
+    connected outputs changes, so a hand-written kscreen-doctor call with stale ids
+    silently fails. This resolves them fresh.
+    """
+    dummy_name = cfg["dummy"].strip()
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        log(f"rescue failed: {exc}")
+        return 1
+
+    targets, x = [], 0
+    for output in outputs.values():
+        if not output.connected or output.name == dummy_name:
+            continue
+        mode = max(output.modes, key=lambda m: (m.width * m.height, m.refresh), default=None)
+        targets.append(Target(
+            name=output.name, enabled=True, mode_id=mode.id if mode else None,
+            pos=(x, 0), scale=1.0, rotation=0, priority=len(targets) + 1,
+        ))
+        if mode:
+            x += mode.width
+
+    if not targets:
+        log("rescue: no non-dummy output is connected")
+        return 1
+
+    log(f"rescue: enabling {[t.name for t in targets]}")
+    try:
+        apply_targets(targets)
+    except KScreenError as exc:
+        log(f"rescue failed: {exc}")
+        return 1
+    clear_state()
+    log("rescue: desktop restored")
+    return 0
 
 
 def cmd_status(cfg, _args) -> int:
@@ -830,6 +911,7 @@ COMMANDS = {
     "on": cmd_on,
     "off": cmd_off,
     "toggle": cmd_toggle,
+    "rescue": cmd_rescue,
     "watch": cmd_watch,
     "doctor": cmd_doctor,
     "_inhibit": cmd_inhibit,
@@ -846,7 +928,7 @@ def main() -> int:
         nargs="?",
         default="status",
         choices=[c for c in COMMANDS if not c.startswith("_")] + ["_inhibit"],
-        help="status (default), on, off, toggle, watch, doctor",
+        help="status (default), on, off, toggle, rescue, watch, doctor",
     )
     parser.add_argument(
         "--client",
