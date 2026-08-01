@@ -1,0 +1,11 @@
+# Virtual pointers are not gamepads.
+#
+# keyd's virtual pointer and Sunshine's absolute mouse expose ABS axes, so udev's
+# input_id builtin tags them ID_INPUT_JOYSTICK and they show up as /dev/input/js*.
+# SDL enumerates by that tag, so a game binding to the first pad it sees reads a mouse
+# axis as a stick and finds no buttons -- the menu scrolls but nothing selects.
+#
+# Install: sudo install -m644 99-rpd-not-joysticks.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=input
+SUBSYSTEM=="input", ATTRS{name}=="keyd virtual pointer", ENV{ID_INPUT_JOYSTICK}=""
+SUBSYSTEM=="input", ATTRS{name}=="Mouse passthrough (absolute)", ENV{ID_INPUT_JOYSTICK}=""

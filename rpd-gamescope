@@ -26,4 +26,9 @@ case " $flags " in
     *) unset DXVK_HDR ;;
 esac
 
+# keyd's virtual pointer and Sunshine's absolute mouse both carry ABS axes, so udev
+# tags them ID_INPUT_JOYSTICK and SDL enumerates them as gamepads. A game that binds
+# to the first pad it sees then reads a mouse axis as a stick and finds no buttons.
+export SDL_GAMECONTROLLER_IGNORE_DEVICES="${SDL_GAMECONTROLLER_IGNORE_DEVICES:-0x0fac/0x1ade,0xbeef/0xdead}"
+
 exec gamescope $flags "$@"
