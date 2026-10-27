@@ -140,20 +140,20 @@ def full_modes():
 
 
 def midbw_modes():
-    """The same client targets for a plug measured at roughly 340 MHz of pixel clock.
+    """Targets for a plug measured at roughly 340 MHz of pixel clock.
 
-    Every refresh here is one a Moonlight client actually asks for, so the exact-cadence
-    property Sunshine needs survives the derate; 1920x1080@140 would fit the link but no
-    client would ever request it.
+    Tuned for a Steam Deck OLED, the only client this host streams to: 90 Hz panel, so the
+    1920x1200 modes are exact cadence for a 90 fps request and the 2:1 ratio a 60 fps request
+    needs, while the 1280x800 pair gives the scorer a panel-sized option. 1920x1200@89 is gone
+    on purpose: it approximated 90 Hz closely enough to win the cadence tie against 120 Hz, and
+    an exact 90 now beats it outright.
     """
     return [
-        (cvt_rb(2560, 1600, 75), W10, H10),
+        (cvt_rb(1920, 1200, 90), W10, H10),
         (cvt_rb(1920, 1200, 120), W10, H10),
-        (cvt_rb(2560, 1440, 75), W9, H9),
-        (cvt_rb(2400, 1500, 75), W10, H10),
-        (cvt_rb(1920, 1080, 120), W9, H9),
-        (cvt_rb(3840, 2160, 30), W9, H9),
-        (cvt_rb(1920, 1200, 89), W10, H10),
+        (cvt_rb(1280, 800, 90), W10, H10),
+        (cvt_rb(1280, 800, 120), W10, H10),
+        (cvt_rb(2560, 1600, 75), W10, H10),
     ]
 
 
