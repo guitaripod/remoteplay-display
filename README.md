@@ -88,6 +88,12 @@ The service handles Steam sessions automatically. Every layout carries an owner 
 | `steam_log` | `~/.steam/steam/logs/streaming_log.txt` | where to read the client capture hint |
 | `capture_hint_max_age` | `120` | seconds before a capture hint is considered stale |
 | `settle_timeout` | `10.0` | seconds to wait for KWin to apply a layout |
+| `staged` | *(empty)* | connector names of outputs behind an MST hub; they are disabled before, and re-enabled after, everything else, and matched by EDID afterwards so renumbering does not matter |
+| `stage_gap` | `0.5` | seconds between disabling the staged outputs and switching the rest |
+| `chain_settle` | `3.0` | on restore, how long the chain must hold still after re-enumerating before its outputs are re-enabled |
+| `rescue_max_refresh` | `0` | cap on the refresh rate `rescue` picks per output; 0 means highest available |
+| `focus_game` | `true` | after switching, keep the streamed game's window focused on the dummy (see below) |
+| `ignore` | *(empty)* | connector names this daemon never snapshots, disables, enables or rescues |
 
 ## Dummy EDID
 
@@ -177,6 +183,8 @@ This is also the workaround for games that bind input to whichever pad is "playe
 **Mode ids, not mode names.** A dummy plug commonly exposes several distinct modes sharing one name — one tested plug has two different modes both called `1920x1080@60`. Layouts are therefore snapshotted as `(width, height, refresh)` and re-resolved against the live mode list at apply time. This is load-bearing rather than theoretical: KWin renumbers mode ids whenever connectors re-enumerate, so a monitor power-cycle mid-session is enough to invalidate them.
 
 **Verification, not fire-and-forget.** After applying, state is polled every 250ms until the expected outputs are enabled and the dummy's mode size matches, with one retry before failing loudly. Position and priority are deliberately not asserted, because KWin normalizes output geometry and asserting it produces false failures.
+
+**Game focus.** A game can have its window up before the dummy is the only output, and disabling the output it was on leaves it unfocused, so Steam captures the (black) desktop instead. After the switch the daemon reads the game's PIDs from Steam's host log and runs a small KWin script over D-Bus that moves those windows to the current desktop and activates the largest window of the most recently started process -- launchers first, the real game last. It re-runs whenever the host log shows a new process or window, so a launcher handing off to the game is followed, and is a no-op when the right window is already active. `focus_game = false` turns it off.
 
 **Idle inhibition.** A detached child holds `org.freedesktop.ScreenSaver.Inhibit` plus a logind `idle:sleep` block for the duration of a session. Gamepad-only input may not reset KWin's idle timer, and a blanked dummy means a black stream with no local display to notice it on.
 

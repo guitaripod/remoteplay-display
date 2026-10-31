@@ -46,6 +46,12 @@ DEFAULTS = {
     "scratch_desktop": "true",
     "scratch_desktop_name": "Streaming",
     "settle_timeout": "10.0",
+    "ignore": "",
+    "staged": "",
+    "stage_gap": "0.5",
+    "chain_settle": "3.0",
+    "rescue_max_refresh": "0",
+    "focus_game": "true",
 }
 
 ROTATION_NAMES = {1: "none", 2: "left", 4: "inverted", 8: "right"}
@@ -71,6 +77,115 @@ def load_config() -> configparser.SectionProxy:
     if CONFIG_PATH.exists():
         parser.read(CONFIG_PATH, encoding="utf-8")
     return parser["remoteplay"]
+
+
+def _csv(cfg, key: str) -> set[str]:
+    return {n.strip() for n in str(cfg.get(key, "")).split(",") if n.strip()}
+
+
+def ignored_outputs(cfg) -> set[str]:
+    """Connector names this instance never touches (another instance's dummy, etc.)."""
+    return _csv(cfg, "ignore")
+
+
+STAGED_CACHE = STATE_DIR / "staged-identities.json"
+
+
+def staged_outputs(cfg) -> set[str]:
+    """Connector names switched in their own stage, before and after everything else.
+
+    Meant for sinks behind an MST hub. Disabling or re-enabling the primary output
+    while their streams are live forces amdgpu to rebuild the whole chain mid-modeset,
+    which KWin does not survive; taking the chain down first and bringing it back last
+    keeps each modeset to one link. Names are only used to identify them at switch
+    time -- on restore they are matched by EDID, because MST sinks get renumbered.
+    """
+    return _csv(cfg, "staged")
+
+
+def resolve_staged(cfg, outputs: dict[str, "Output"]) -> set[str]:
+    """Current connector names of the staged outputs.
+
+    Names in the config are a one-time hint: the first time one is seen connected its
+    EDID identity is cached, and from then on the match is by identity, so the chain
+    being renumbered by the kernel does not silently turn staging off.
+    """
+    names = staged_outputs(cfg)
+    if not names:
+        return set()
+    try:
+        cached = set(json.loads(STAGED_CACHE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        cached = set()
+    learned = {edid_identity(n) for n in names if n in outputs and outputs[n].connected}
+    learned.discard(None)
+    if learned - cached:
+        cached |= learned
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            STAGED_CACHE.write_text(json.dumps(sorted(cached)), encoding="utf-8")
+        except OSError as exc:
+            log(f"could not cache staged identities: {exc}")
+    resolved = {o.name for o in outputs.values()
+                if o.connected and (o.name in names or edid_identity(o.name) in cached)}
+    if not resolved:
+        log(f"WARNING: 'staged' is set ({', '.join(sorted(names))}) but no connected output "
+            f"matches by name or EDID; switching will NOT be staged")
+    return resolved
+
+
+def edid_identity(connector: str) -> str | None:
+    """A stable identity for whatever is plugged into a connector, from its EDID.
+
+    Product name + serial descriptors + the numeric serial, so two monitors of the
+    same model stay apart even after the kernel renames their connectors.
+    """
+    for card in sorted(Path("/sys/class/drm").glob(f"card*-{connector}")):
+        try:
+            data = (card / "edid").read_bytes()
+        except OSError:
+            continue
+        if len(data) < 128:
+            continue
+        parts = [data[8:16].hex()]
+        for offset in range(54, 126, 18):
+            block = data[offset:offset + 18]
+            if block[0:3] == b"\x00\x00\x00" and block[3] in (0xFC, 0xFF):
+                parts.append(block[5:18].split(b"\n")[0].decode("ascii", "replace").strip())
+        return "|".join(parts)
+    return None
+
+
+def _connected_identities() -> dict[str, str]:
+    """connector name -> EDID identity for every connected connector, straight from sysfs."""
+    found: dict[str, str] = {}
+    for card in sorted(Path("/sys/class/drm").glob("card*-*")):
+        try:
+            if (card / "status").read_text().strip() != "connected":
+                continue
+        except OSError:
+            continue
+        name = card.name.split("-", 1)[1]
+        ident = edid_identity(name)
+        if ident:
+            found[name] = ident
+    return found
+
+
+def wait_chain_settled(identities: list[str], timeout: float, quiet: float) -> bool:
+    """Wait until every wanted EDID identity is connected and the set has stopped changing."""
+    deadline = time.monotonic() + timeout
+    last, stable_since = None, None
+    while True:
+        present = _connected_identities()
+        have = all(any(v == want for v in present.values()) for want in identities)
+        if present != last:
+            last, stable_since = present, time.monotonic()
+        elif have and time.monotonic() - stable_since >= quiet:
+            return True
+        if time.monotonic() >= deadline:
+            return have
+        time.sleep(0.5)
 
 
 @dataclass(frozen=True)
@@ -465,6 +580,178 @@ def leave_scratch_desktop(state: dict) -> None:
         log(f"could not remove the scratch virtual desktop: {exc}")
 
 
+GAME_PROCESS_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\[[\d.]+\] Adding process (\d+) for gameID (\d+)")
+
+KWIN_FOCUS_SCRIPT = """
+// pids: oldest process first, newest last (Steam's order). Launchers come first,
+// the real game last, so prefer the newest process that has a real window.
+const pids = %s;
+const target = workspace.currentDesktop;
+const byPid = new Map();
+for (const w of workspace.windowList()) {
+    if (!pids.includes(w.pid)) continue;
+    if (!w.normalWindow || w.minimized) continue;
+    if (w.width < 320 || w.height < 200) continue;   // splash stubs, tray helpers
+    try { w.desktops = [target]; } catch (e) {}
+    if (!byPid.has(w.pid)) byPid.set(w.pid, []);
+    byPid.get(w.pid).push(w);
+}
+let picked = null;
+for (let i = pids.length - 1; i >= 0 && !picked; i--) {
+    const wins = byPid.get(pids[i]);
+    if (!wins) continue;
+    for (const w of wins) {
+        if (!picked || w.width * w.height > picked.width * picked.height) picked = w;
+    }
+}
+if (picked && workspace.activeWindow !== picked) {
+    workspace.activeWindow = picked;
+}
+"""
+
+
+def streamed_game_pids(cfg, since: datetime) -> list[int]:
+    """PIDs Steam has attached to the game it is streaming, from the host log."""
+    path = Path(os.path.expanduser(cfg["steam_log"]))
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256 * 1024))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    pids: list[int] = []
+    for line in tail.splitlines():
+        match = GAME_PROCESS_RE.match(line)
+        if not match:
+            continue
+        stamp = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        pid = int(match.group(2))
+        if stamp >= since - timedelta(seconds=15) and pid not in pids:
+            pids.append(pid)          # log order: oldest first, newest last
+    return pids
+
+
+def focus_streamed_game(cfg, since: datetime) -> bool:
+    """Bring the streamed game's window onto the current desktop and give it focus.
+
+    A game launched from the client often has its window up before the dummy is
+    the only output. Disabling the output it was on leaves it unfocused (and, with
+    the scratch desktop, on another desktop), so Steam's capture drops back to the
+    desktop, which is black on KDE Wayland. KWin's scripting API can move and
+    activate the window by PID; Steam's host log tells us which PIDs are the game.
+    """
+    if not _enabled(cfg, "focus_game"):
+        return False
+    pids = streamed_game_pids(cfg, since)
+    if not pids:
+        return False
+    script = KWIN_FOCUS_SCRIPT % json.dumps(pids)
+    name = f"{APP}-focus-{os.getpid()}"
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = STATE_DIR / f"{name}.js"
+        path.write_text(script, encoding="utf-8")
+        _busctl("call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting",
+                "unloadScript", "s", name)
+        out = _busctl("call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting",
+                      "loadScript", "ss", str(path), name)
+        script_id = int(out.split()[-1])
+        if script_id < 0:
+            log("KWin refused the focus script")
+            return False
+        _busctl("call", "org.kde.KWin", f"/Scripting/Script{script_id}",
+                "org.kde.kwin.Script", "run")
+        time.sleep(0.3)
+        _busctl("call", "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting",
+                "unloadScript", "s", name)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError, OSError) as exc:
+        log(f"could not focus the streamed game: {exc}")
+        return False
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except (OSError, NameError):
+            pass
+    log(f"focused streamed game (pids {pids})")
+    return True
+
+
+def focus_streamed_game_retry(cfg, since: datetime, delays=(0.0, 2.0, 5.0)) -> None:
+    """The game's main window may appear a few seconds after launch; try a few times."""
+    for i, delay in enumerate(delays):
+        if delay:
+            time.sleep(delay)
+        if focus_streamed_game(cfg, since) and i > 0:
+            return
+
+
+GAME_WINDOW_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\[[\d.]+\] Adding window (\d+) \(\d+\) for process (\d+) and gameID")
+_focus_tracker: dict = {"size": -1, "sig": None, "pending": []}
+FOCUS_FOLLOWUPS = (2.0, 5.0, 10.0)
+
+
+def _game_signature(cfg, since: datetime) -> tuple:
+    """What has changed about the streamed game: its PIDs and the windows Steam saw."""
+    pids = streamed_game_pids(cfg, since)
+    path = Path(os.path.expanduser(cfg["steam_log"]))
+    windows = 0
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256 * 1024))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return (tuple(pids), 0)
+    for line in tail.splitlines():
+        match = GAME_WINDOW_RE.match(line)
+        if match and int(match.group(3)) in pids:
+            if datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S") >= since - timedelta(seconds=15):
+                windows += 1
+    return (tuple(pids), windows)
+
+
+def maintain_focus(cfg) -> None:
+    """Keep the streamed game focused as its processes and windows change mid-session.
+
+    Launchers hand off to the real game seconds or minutes after the stream starts,
+    and that window appears unfocused. Cheap to poll: nothing is read unless Steam's
+    host log has grown, and the focus script does nothing if the right window is
+    already active.
+    """
+    if not _enabled(cfg, "focus_game"):
+        return
+    state = read_state()
+    if not state.get("active") or state.get("owner") != "auto":
+        _focus_tracker["sig"] = None
+        _focus_tracker["size"] = -1
+        _focus_tracker["pending"] = []
+        return
+    since = datetime.fromisoformat(state["since"])
+    now = time.monotonic()
+    # follow-up passes scheduled by an earlier change (a window that went fullscreen
+    # a few seconds after it was created leaves no trace in Steam's log)
+    due = [t for t in _focus_tracker["pending"] if t <= now]
+    if due:
+        _focus_tracker["pending"] = [t for t in _focus_tracker["pending"] if t > now]
+        focus_streamed_game(cfg, since)
+    try:
+        size = Path(os.path.expanduser(cfg["steam_log"])).stat().st_size
+    except OSError:
+        return
+    if size == _focus_tracker["size"]:
+        return
+    _focus_tracker["size"] = size
+    sig = _game_signature(cfg, since)
+    if sig == _focus_tracker["sig"]:
+        return
+    first = _focus_tracker["sig"] is None
+    _focus_tracker["sig"] = sig
+    if not first:
+        focus_streamed_game(cfg, since)
+        _focus_tracker["pending"] = [now + d for d in FOCUS_FOLLOWUPS]
+
+
 def activate(cfg, owner: str, hint=None) -> bool:
     with StateLock():
         state = read_state()
@@ -474,6 +761,8 @@ def activate(cfg, owner: str, hint=None) -> bool:
 
         outputs = read_outputs()
         dummy_name = cfg["dummy"].strip()
+        skip = ignored_outputs(cfg) | {dummy_name}
+        staged = resolve_staged(cfg, outputs) - skip
         dummy = outputs.get(dummy_name)
         if dummy is None or not dummy.connected:
             log(f"dummy output {dummy_name!r} is not connected; refusing to switch")
@@ -486,29 +775,35 @@ def activate(cfg, owner: str, hint=None) -> bool:
         snapshot = [
             {
                 "name": o.name,
+                "identity": edid_identity(o.name),
+                "staged": o.name in staged,
                 "enabled": o.enabled,
                 "priority": o.priority,
                 "pos": list(o.pos),
                 "scale": o.scale,
                 "rotation": o.rotation,
                 "mode": _mode_record(o),
+                "hdr": o.hdr_enabled if o.hdr_capable else None,
             }
             for o in outputs.values()
-            if o.connected and o.name != dummy_name
+            if o.connected and o.name not in skip
         ]
         _repair_snapshot(snapshot)
 
+        stage1 = [Target(name=o.name, enabled=False)
+                  for o in outputs.values() if o.name in staged and o.enabled]
         targets = [Target(name=dummy_name, enabled=True, mode_id=mode.id, pos=(0, 0),
                           scale=1.0, rotation=1, priority=1,
                           hdr=_wants_hdr(cfg) if dummy.hdr_capable else None)]
         targets += [
             Target(name=o.name, enabled=False)
             for o in outputs.values()
-            if o.name != dummy_name and o.enabled
+            if o.name not in skip and o.name not in staged and o.enabled
         ]
 
         log(f"switching to {dummy_name} @ {mode} ({reason}); "
-            f"disabling {[t.name for t in targets if not t.enabled] or 'nothing'}")
+            f"disabling {[t.name for t in stage1] or 'nothing'} first, then "
+            f"{[t.name for t in targets if not t.enabled] or 'nothing'}")
         write_state({
             "active": True,
             "owner": owner,
@@ -518,18 +813,26 @@ def activate(cfg, owner: str, hint=None) -> bool:
             "snapshot": snapshot,
             "inhibitor_pid": None,
         })
+        settle = float(cfg["settle_timeout"])
         try:
+            if stage1:
+                apply_targets(stage1)
+                gone = {t.name for t in stage1}
+                if wait_until(lambda snap: not gone & {o.name for o in snap.values() if o.enabled},
+                              settle) is None:
+                    log(f"WARNING: {sorted(gone)} still enabled after stage 1; continuing")
+                time.sleep(float(cfg["stage_gap"]))
             apply_targets(targets)
         except KScreenError as exc:
             log(f"switch failed: {exc}; restoring")
             clear_state()
-            _restore(snapshot, dummy_name, float(cfg["settle_timeout"]))
+            _restore(snapshot, dummy_name, cfg)
             return False
 
         settled = wait_until(
-            lambda snap: _only_enabled(snap, dummy_name)
+            lambda snap: _only_enabled(snap, dummy_name, skip)
             and _mode_matches(snap.get(dummy_name), mode),
-            float(cfg["settle_timeout"]),
+            settle,
         )
         if settled is None:
             log("WARNING: display state did not settle as expected; retrying once")
@@ -538,8 +841,8 @@ def activate(cfg, owner: str, hint=None) -> bool:
             except KScreenError as exc:
                 log(f"retry failed: {exc}")
             settled = wait_until(
-                lambda snap: _only_enabled(snap, dummy_name),
-                float(cfg["settle_timeout"]),
+                lambda snap: _only_enabled(snap, dummy_name, skip),
+                settle,
             )
             if settled is None:
                 log("ERROR: could not confirm dummy-only layout")
@@ -551,6 +854,14 @@ def activate(cfg, owner: str, hint=None) -> bool:
             state["previous_desktop"], state["scratch_desktop"] = desktops
         write_state(state)
         log(f"remote mode active on {dummy_name} @ {mode}")
+        if owner == "auto":
+            since = datetime.fromisoformat(state["since"])
+            focus_streamed_game_retry(cfg, since)
+            try:
+                _focus_tracker["size"] = Path(os.path.expanduser(cfg["steam_log"])).stat().st_size
+                _focus_tracker["sig"] = _game_signature(cfg, since)
+            except OSError:
+                pass
         return True
 
 
@@ -585,8 +896,14 @@ def _mode_record(output: Output) -> dict | None:
     return {"width": mode.width, "height": mode.height, "refresh": mode.refresh}
 
 
-def _only_enabled(snapshot: dict[str, Output], name: str) -> bool:
-    enabled = {o.name for o in snapshot.values() if o.enabled}
+def _only_enabled(snapshot: dict[str, Output], name: str, skip: set[str] = frozenset()) -> bool:
+    """True when `name` is the only enabled output, ignoring outputs in `skip`.
+
+    `skip` may contain `name` itself (callers pass ignore | {dummy}); it must never be
+    filtered out here, or the check can never pass.
+    """
+    enabled = {o.name for o in snapshot.values()
+               if o.enabled and (o.name == name or o.name not in skip)}
     return enabled == {name}
 
 
@@ -609,30 +926,38 @@ def deactivate(cfg, force: bool = False, owner: str | None = None) -> bool:
             return True
         stop_inhibitor(state.get("inhibitor_pid"))
         leave_scratch_desktop(state)
-        ok = _restore(state.get("snapshot") or [], state.get("dummy", ""),
-                      float(cfg["settle_timeout"]))
+        ok = _restore(state.get("snapshot") or [], state.get("dummy", ""), cfg)
         clear_state()
         log("desktop layout restored" if ok else "desktop layout restore incomplete")
         return ok
 
 
-def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bool:
-    try:
-        outputs = read_outputs()
-    except KScreenError as exc:
-        log(f"cannot read outputs while restoring: {exc}")
-        return False
+def _resolve(entry: dict, outputs: dict[str, Output], claimed: set[str]) -> Output | None:
+    """Find the connected output a snapshot entry refers to: by EDID identity, then name."""
+    ident = entry.get("identity")
+    if ident:
+        for o in outputs.values():
+            if o.connected and o.name not in claimed and edid_identity(o.name) == ident:
+                return o
+    o = outputs.get(entry["name"])
+    if o is not None and o.connected and o.name not in claimed:
+        return o
+    return None
 
+
+def _restore_targets(entries: list[dict], outputs: dict[str, Output],
+                     claimed: set[str]) -> list[Target]:
     targets: list[Target] = []
-    for entry in snapshot:
-        if entry["name"] == dummy_name:
-            continue
-        output = outputs.get(entry["name"])
-        if output is None or not output.connected:
+    for entry in entries:
+        output = _resolve(entry, outputs, claimed)
+        if output is None:
             log(f"skipping {entry['name']}: no longer connected")
             continue
+        claimed.add(output.name)
+        if output.name != entry["name"]:
+            log(f"{entry['name']} is now {output.name} (matched by EDID)")
         if not entry["enabled"]:
-            targets.append(Target(name=entry["name"], enabled=False))
+            targets.append(Target(name=output.name, enabled=False))
             continue
         mode_id = None
         record = entry.get("mode")
@@ -640,33 +965,28 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
             mode = output.match_mode(record["width"], record["height"], record["refresh"])
             mode_id = mode.id if mode else None
             if mode_id is None:
-                log(f"{entry['name']}: saved mode {record['width']}x{record['height']} "
+                log(f"{output.name}: saved mode {record['width']}x{record['height']} "
                     f"unavailable, leaving current mode")
         targets.append(Target(
-            name=entry["name"],
+            name=output.name,
             enabled=True,
             mode_id=mode_id,
             pos=tuple(entry["pos"]),
             scale=entry.get("scale"),
             rotation=entry.get("rotation"),
             priority=entry.get("priority"),
+            hdr=entry.get("hdr") if output.hdr_capable else None,
         ))
+    return targets
 
-    if not any(t.enabled for t in targets):
-        log("WARNING: no saved output is connected; keeping the dummy enabled")
-        if dummy_name in outputs:
-            targets.append(Target(name=dummy_name, enabled=True))
-    elif dummy_name in outputs:
-        targets.insert(0, Target(name=dummy_name, enabled=False))
 
-    if not targets:
-        return True
+def _apply_and_wait(targets: list[Target], dummy_name: str, settle_timeout: float,
+                    label: str) -> bool:
     try:
         apply_targets(targets)
     except KScreenError as exc:
-        log(f"restore failed: {exc}")
+        log(f"restore ({label}) failed: {exc}")
         return False
-
     expected = {t.name for t in targets if t.enabled}
     settled = wait_until(
         lambda snap: expected <= {o.name for o in snap.values() if o.enabled}
@@ -674,8 +994,62 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
         settle_timeout,
     )
     if settled is None:
-        log(f"WARNING: {dummy_name} did not settle as expected after restore")
+        log(f"WARNING: {label} did not settle as expected after restore")
     return settled is not None
+
+
+def _restore(snapshot: list[dict], dummy_name: str, cfg) -> bool:
+    """Bring the saved layout back, chain-staged outputs last.
+
+    Stage 1 disables the dummy and re-enables every unstaged output (the primary
+    among them). Stage 2 waits for the MST chain to finish re-enumerating behind
+    that, then re-enables the staged outputs, matched by EDID since their names
+    may have changed.
+    """
+    settle_timeout = float(cfg["settle_timeout"])
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        log(f"cannot read outputs while restoring: {exc}")
+        return False
+
+    skip = ignored_outputs(cfg) | {dummy_name}
+    entries = [e for e in snapshot if e["name"] not in skip]
+    first = [e for e in entries if not e.get("staged")]
+    later = [e for e in entries if e.get("staged")]
+
+    claimed: set[str] = set()
+    targets = _restore_targets(first, outputs, claimed)
+
+    if not any(t.enabled for t in targets) and not later:
+        log("WARNING: no saved output is connected; keeping the dummy enabled")
+        if dummy_name in outputs:
+            targets.append(Target(name=dummy_name, enabled=True))
+    elif dummy_name in outputs:
+        targets.insert(0, Target(name=dummy_name, enabled=False))
+
+    ok = True
+    if targets:
+        ok = _apply_and_wait(targets, dummy_name, settle_timeout, "stage 1")
+
+    if later:
+        wanted = [e["identity"] for e in later if e.get("identity")]
+        if not wait_chain_settled(wanted, settle_timeout * 2, float(cfg["chain_settle"])):
+            log("WARNING: chain outputs did not all reappear; restoring what is there")
+        try:
+            outputs = read_outputs()
+        except KScreenError as exc:
+            log(f"cannot read outputs for stage 2: {exc}")
+            return False
+        targets = _restore_targets(later, outputs, claimed)
+        if targets:
+            ok = _apply_and_wait(targets, dummy_name, settle_timeout, "stage 2") and ok
+        elif not any(o.enabled for o in outputs.values() if o.name not in skip):
+            log("WARNING: nothing came back; re-enabling the dummy so the desktop is not dark")
+            if dummy_name in outputs:
+                _apply_and_wait([Target(name=dummy_name, enabled=True)], "", settle_timeout, "fallback")
+            ok = False
+    return ok
 
 
 def cmd_on(cfg, args) -> int:
@@ -748,6 +1122,8 @@ def cmd_rescue(cfg, _args) -> int:
     silently fails. This resolves them fresh.
     """
     dummy_name = cfg["dummy"].strip()
+    skip = ignored_outputs(cfg) | {dummy_name}
+    cap = float(cfg.get("rescue_max_refresh", "0") or 0)
     try:
         outputs = read_outputs()
     except KScreenError as exc:
@@ -756,9 +1132,11 @@ def cmd_rescue(cfg, _args) -> int:
 
     targets, x = [], 0
     for output in outputs.values():
-        if not output.connected or output.name == dummy_name:
+        if not output.connected or output.name in skip:
             continue
-        mode = max(output.modes, key=lambda m: (m.width * m.height, m.refresh), default=None)
+        candidates = [m for m in output.modes if cap <= 0 or m.refresh <= cap + 0.5]
+        mode = max(candidates or output.modes,
+                   key=lambda m: (m.width * m.height, m.refresh), default=None)
         targets.append(Target(
             name=output.name, enabled=True, mode_id=mode.id if mode else None,
             pos=(x, 0), scale=1.0, rotation=0, priority=len(targets) + 1,
@@ -831,6 +1209,11 @@ def cmd_doctor(cfg, args) -> int:
         state = "connected" if output.connected else "disconnected"
         print(f"  {output.name:<10} {state:<13} edid={name!r}{mark}")
 
+    if staged_outputs(cfg):
+        print(f"staged:    {sorted(resolve_staged(cfg, outputs)) or 'NONE MATCHED'} "
+              f"(config: {', '.join(sorted(staged_outputs(cfg)))})")
+    if ignored_outputs(cfg):
+        print(f"ignore:    {', '.join(sorted(ignored_outputs(cfg)))}")
     dummy = outputs.get(dummy_name)
     if dummy is None or not dummy.connected:
         print(f"dummy:     NOT CONNECTED ({dummy_name}) - fix 'dummy' in {CONFIG_PATH}")
@@ -984,6 +1367,8 @@ def _consume_events(cfg, proc, auto: bool, known: bool) -> bool:
     pending_until = None
     last_reconcile = time.monotonic()
     while proc.poll() is None:
+        if auto:
+            maintain_focus(cfg)
         deadline = pending_until if pending_until else last_reconcile + RECONCILE_INTERVAL
         wait = max(0.05, min(MAX_SELECT_WAIT, deadline - time.monotonic()))
         if selector.select(timeout=wait):
