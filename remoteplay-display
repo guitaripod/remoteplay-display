@@ -847,7 +847,7 @@ def cmd_doctor(cfg, args) -> int:
     steam_log = Path(os.path.expanduser(cfg["steam_log"]))
     print(f"steam log: {steam_log} {'ok' if steam_log.exists() else 'MISSING'}")
     print(f"hint:      {latest_capture_hint(cfg) or 'none recent'}")
-    print(f"sunshine:  {sunshine_integration_status()}")
+    print(f"sunshine:  {sunshine_integration_status(dummy_name)}")
 
     unit = subprocess.run(
         ["systemctl", "--user", "is-active", f"{APP}.service"],
@@ -860,7 +860,7 @@ def cmd_doctor(cfg, args) -> int:
     return 0 if problems == 0 else 1
 
 
-def sunshine_integration_status() -> str:
+def sunshine_integration_status(dummy: str) -> str:
     """Report whether Sunshine's prep commands hand sessions to this tool."""
     conf = CONFIG_HOME / "sunshine" / "sunshine.conf"
     if not conf.exists():
@@ -877,8 +877,8 @@ def sunshine_integration_status() -> str:
     output = next(
         (line for line in text.splitlines() if line.strip().startswith("output_name")), ""
     )
-    index = output.split("=", 1)[1].strip() if "=" in output else "unset"
-    warn = "" if index == "0" else f"; WARNING output_name={index}, expected 0"
+    value = output.split("=", 1)[1].strip() if "=" in output else "unset"
+    warn = "" if value == dummy else f"; WARNING output_name={value}, expected {dummy} (the dummy connector)"
     return f"wired via global_prep_cmd{warn}"
 
 
