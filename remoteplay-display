@@ -140,7 +140,10 @@ def read_outputs(retries: int = 3) -> dict[str, Output]:
             else:
                 return {o.name: o for o in (_parse_output(raw) for raw in payload["outputs"])}
         else:
-            last_error = (result.stderr or result.stdout).strip()
+            detail = (result.stderr or result.stdout).strip()
+            last_error = detail or (
+                f"exit {result.returncode}, no output (is WAYLAND_DISPLAY set for this shell?)"
+            )
         if attempt + 1 < retries:
             time.sleep(0.4)
     raise KScreenError(f"kscreen-doctor --json failed: {last_error}")
